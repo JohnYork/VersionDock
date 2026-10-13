@@ -1219,21 +1219,13 @@ export class GitService {
 
       let isGone: boolean | undefined;
       if (isNamedBranch) {
-        // If upstream and aheadBehind are already provided by vsRepo HEAD, skip running
-        // the external `git for-each-ref` CLI unless tracking information is missing.
-        if (!upstream || aheadBehind === undefined) {
-          try {
-            const tracking = (await this.getLocalBranchTrackingInfo()).get(branchName);
-            if (tracking) {
-              upstream = tracking.upstream ?? upstream;
-              if (tracking.aheadBehind !== undefined) {
-                aheadBehind = tracking.aheadBehind;
-              }
-              if (tracking.isGone !== undefined) {
-                isGone = tracking.isGone;
-              }
-            }
-          } catch { /* ignore fallback */ }
+        // VS Code's nonzero tracking counts can also be stale after writes.
+        // Read Git's tracking metadata even when the API has populated HEAD.
+        const tracking = (await this.getLocalBranchTrackingInfo()).get(branchName);
+        if (tracking) {
+          upstream = tracking.upstream;
+          aheadBehind = tracking.aheadBehind;
+          isGone = tracking.isGone;
         }
       }
 

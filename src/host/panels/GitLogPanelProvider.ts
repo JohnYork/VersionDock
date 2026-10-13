@@ -280,6 +280,9 @@ export class GitLogPanelProvider implements vscode.WebviewViewProvider, vscode.D
       }, 300);
     };
     const scheduleManagerSync = () => {
+      // A pending read may have started before the operation that emitted this
+      // event. New generations must not reuse that snapshot as fresh metadata.
+      this.pendingAllBranchesTask = null;
       void syncManagerState().catch(error => {
         this.logger.error('GitLog', 'Failed to synchronize repositories', error);
       });

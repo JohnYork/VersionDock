@@ -96,6 +96,22 @@ function getWorkspaceStatusSignature(status: WorkspaceStatus): string {
     .join('\u0003');
 }
 
+function getWorkspaceBranchSignature(status: WorkspaceStatus): string {
+  return JSON.stringify([...status.repos]
+    .sort((left, right) => left.repoId.localeCompare(right.repoId))
+    .map(({ repoId, branch }) => [
+      repoId,
+      branch.fullName,
+      branch.lastCommitHash ?? '',
+      branch.detachedTag ?? '',
+      branch.detachedHash ?? '',
+      branch.upstream ?? '',
+      branch.aheadBehind?.ahead,
+      branch.aheadBehind?.behind,
+      branch.isGone ?? false,
+    ]));
+}
+
 function getRepositoryMetadataSignature(repos: readonly RepoMeta[]): string {
   return JSON.stringify(
     [...repos]
@@ -431,6 +447,7 @@ export class WorkspaceGitManager implements vscode.Disposable {
   private statusUpdateSuppressionDepth = 0;
   private lastPublishedStatus: WorkspaceStatus | null = null;
   private cachedAllBranches: BranchInfo[] = [];
+  private branchQueryGeneration = 0;
   private mergeCompletionTasks = new Map<string, Promise<MergeCommitResult | undefined>>();
   /** Set after a branch/HEAD change so intermediate checkout states are never published. */
   private statusStabilizationSignature: string | null | undefined;
@@ -1137,15 +1154,42 @@ export class WorkspaceGitManager implements vscode.Disposable {
         }
       });
       this.watchers.push(d);
-      // vsRepo.state.onDidChange covers git index changes but may miss rapid
-      // working-tree edits that haven't been staged. Also watch saved documents
-      // inside this repo — onDidSaveTextDocument is already set up in constructor.
-      return;
     }
 
-    // Fallback: FileSystemWatcher when vscode.git is unavailable.
-    // Watch .git/index (stage changes), .git/HEAD + refs (branch changes),
-    // and all working-tree file creates/changes/deletes.
+    // Watch refs even with vscode.git: its state event may keep HEAD unchanged
+    // when a non-current branch, remote ref or upstream configuration changes.
+    // Linked worktrees/submodules have a .git file pointing outside the checkout.
+    let gitDir = path.join(repoPath, '.git');
+    let commonDir = gitDir;
+    try {
+      if (fs.statSync(gitDir).isFile()) {
+        const match = fs.readFileSync(gitDir, 'utf8').trim().match(/^gitdir:\s*(.+)$/i);
+        if (match) gitDir = path.resolve(repoPath, match[1].trim());
+      }
+      commonDir = gitDir;
+      const commonDirFile = path.join(gitDir, 'commondir');
+      if (fs.existsSync(commonDirFile)) {
+        commonDir = path.resolve(gitDir, fs.readFileSync(commonDirFile, 'utf8').trim());
+      }
+    } catch { /* best-effort for a repository being removed */ }
+
+    const onBranchChanged = () => {
+      // These watchers deliberately target Git metadata. Applying the working
+      // tree's ignored-folder filter here would discard every .git event.
+      this.scheduleRefresh();
+      this.scheduleBranchRefresh();
+    };
+    for (const metadataDir of new Set([gitDir, commonDir])) {
+      const refs = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(
+        metadataDir, '{HEAD,refs/**,packed-refs,config,config.worktree}',
+      ));
+      refs.onDidChange(onBranchChanged); refs.onDidCreate(onBranchChanged); refs.onDidDelete(onBranchChanged);
+      this.watchers.push(refs);
+    }
+
+    if (vsRepo) return;
+
+    // Without vscode.git, also watch the actual index and working-tree files.
     const ignoredPathPattern = /(?:^|[\\/])(node_modules|\.git|\.svn|dist|build|target|out|\.next|\.nuxt|\.cache|vendor)(?:[\\/]|$)/;
     const shouldIgnore = (uri?: vscode.Uri) => Boolean(uri && ignoredPathPattern.test(uri.fsPath));
 
@@ -1153,26 +1197,16 @@ export class WorkspaceGitManager implements vscode.Disposable {
       if (shouldIgnore(uri)) return;
       this.scheduleRefresh();
     };
-    const onBranchChanged = (uri?: vscode.Uri) => {
-      if (shouldIgnore(uri)) return;
-      this.scheduleRefresh();
-      this.scheduleBranchRefresh();
-    };
-
-    // .git internals
-    const w1 = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(repoPath, '.git/index'));
-    const w2 = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(repoPath, '.git/HEAD'));
-    const w3 = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(repoPath, '.git/refs/**'));
+    const w1 = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(gitDir, 'index'));
     // Working-tree: all three events (create, change, delete) — excludes .git itself
     const w4 = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(repoPath, '**/*'));
     // .gitmodules watcher is already created in reinitialize() for all workspace folders
 
-    w1.onDidChange(onChanged); w1.onDidCreate(onChanged); w1.onDidDelete(onChanged);
-    w2.onDidChange(onBranchChanged); w2.onDidCreate(onBranchChanged);
-    w3.onDidChange(onBranchChanged); w3.onDidCreate(onBranchChanged); w3.onDidDelete(onBranchChanged);
+    const onIndexChanged = () => this.scheduleRefresh();
+    w1.onDidChange(onIndexChanged); w1.onDidCreate(onIndexChanged); w1.onDidDelete(onIndexChanged);
     w4.onDidCreate(onChanged); w4.onDidChange(onChanged); w4.onDidDelete(onChanged);
 
-    this.watchers.push(w1, w2, w3, w4);
+    this.watchers.push(w1, w4);
   }
 
   private setupSvnWatcher(repoPath: string): void {
@@ -1258,6 +1292,13 @@ export class WorkspaceGitManager implements vscode.Disposable {
 
   private publishStatus(status: WorkspaceStatus, context?: StatusChangeContext): void {
     this.detectNewUntrackedFiles(status);
+    // Status refreshes also follow operations outside the log panel, including
+    // auto-completed merges. Push/fetch can change tracking counts without moving
+    // HEAD, so do not rely solely on the VS Code HEAD watcher to notify ref consumers.
+    if (this.lastPublishedStatus
+      && getWorkspaceBranchSignature(status) !== getWorkspaceBranchSignature(this.lastPublishedStatus)) {
+      this.scheduleBranchRefresh();
+    }
     this.lastPublishedStatus = status;
     this.statusListeners.forEach(l => l(status, context));
 
@@ -2321,6 +2362,8 @@ export class WorkspaceGitManager implements vscode.Disposable {
   }
 
   async getAllBranches(options?: { force?: boolean; repoIds?: string[] }): Promise<BranchInfo[]> {
+    const queryGeneration = ++this.branchQueryGeneration;
+    const repositoryGeneration = this.repositoryGeneration;
     const targetRepoIds = options?.repoIds && options.repoIds.length > 0 ? new Set(options.repoIds) : undefined;
     const repoEntries = Array.from(this.repos.values());
     const allBranchesResults = await Promise.all(repoEntries.map(async repo => {
@@ -2389,7 +2432,9 @@ export class WorkspaceGitManager implements vscode.Disposable {
       }
     }
 
-    this.cachedAllBranches = branches;
+    if (queryGeneration === this.branchQueryGeneration && repositoryGeneration === this.repositoryGeneration) {
+      this.cachedAllBranches = branches;
+    }
     return branches;
   }
 
