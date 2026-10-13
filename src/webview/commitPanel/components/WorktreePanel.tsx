@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import type { WorktreeEntry } from '../../shared/msgTypes';
 import { Codicon } from '../../shared/Codicon';
 import { ContextMenu, type ContextMenuEntry } from './ContextMenu';
@@ -52,8 +52,29 @@ function ctxItems(entry: WorktreeEntry): ContextMenuEntry[] {
 
 // ── Single worktree row ───────────────────────────────────────────────────────
 
-function WorktreeRow({ entry, repoId, onDelete, onLock, onUnlock, onOpenInExplorer, onOpenInNewWindow, onOpenInOS, onAddToWorkspace }: {
+// The directory name is already shown, so identify its parent with the shortest
+// unique suffix among worktrees with that same name. Keep roots/drive letters so
+// paths such as /a/project and /b/a/project can still be distinguished.
+function worktreePathTags(worktrees: WorktreeEntry[]): Map<string, string> {
+  const paths = worktrees.map(entry => {
+    const parts = entry.path.replace(/\\/g, '/').replace(/\/+$/, '').split('/');
+    return { path: entry.path, name: parts.pop(), parent: parts };
+  });
+  return new Map(paths.map(current => {
+    const peers = paths.filter(other => other.path !== current.path && other.name === current.name);
+    let depth = 1;
+    while (depth < current.parent.length && peers.some(other =>
+      other.parent.slice(-depth).join('/') === current.parent.slice(-depth).join('/'),
+    )) {
+      depth++;
+    }
+    return [current.path, current.parent.slice(-depth).join('/') || '/'];
+  }));
+}
+
+function WorktreeRow({ entry, pathTag, repoId, onDelete, onLock, onUnlock, onOpenInExplorer, onOpenInNewWindow, onOpenInOS, onAddToWorkspace }: {
   entry: WorktreeEntry;
+  pathTag: string;
   repoId: string;
   onDelete: Props['onDelete'];
   onLock: Props['onLock'];
@@ -66,7 +87,7 @@ function WorktreeRow({ entry, repoId, onDelete, onLock, onUnlock, onOpenInExplor
   const [hovered, setHovered] = useState(false);
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
 
-  const dirName = entry.path.split(/[\\/]/).pop() ?? entry.path;
+  const dirName = entry.path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || entry.path;
 
   const branchLabel = entry.isDetached
     ? entry.head ? entry.head.slice(0, 8) : t('detached HEAD')
@@ -93,6 +114,7 @@ function WorktreeRow({ entry, repoId, onDelete, onLock, onUnlock, onOpenInExplor
           <span style={row.name}>
             <span style={row.nameText}>{dirName}</span>
             {entry.isMain && <span style={row.mainBadge}>{t('main')}</span>}
+            {!entry.isMain && <span style={row.pathBadge} title={entry.path}>{pathTag}</span>}
             {!entry.isMain && entry.isInWorkspace && <span style={row.workspaceBadge}>{t('in workspace')}</span>}
             {entry.isLocked && (
               <Codicon name="lock" style={{ fontSize: '11px' }} />
@@ -212,6 +234,7 @@ function RepoSection({ repo, multiRepo, onDelete, onLock, onUnlock, onPrune, onO
   isFirst?: boolean;
 }) {
   const [collapsed, setCollapsed] = useState(false);
+  const pathTags = useMemo(() => worktreePathTags(repo.worktrees), [repo.worktrees]);
   const hasPrunable = repo.worktrees.some(w => w.isPrunable);
   const projectColor = readableAccentColor(repo.repoColor);
 
@@ -258,6 +281,7 @@ function RepoSection({ repo, multiRepo, onDelete, onLock, onUnlock, onPrune, onO
             <WorktreeRow
               key={w.path}
               entry={w}
+              pathTag={pathTags.get(w.path) ?? w.path}
               repoId={repo.repoId}
               onDelete={onDelete}
               onLock={onLock}
@@ -384,6 +408,12 @@ const row = {
   } as React.CSSProperties,
   mainBadge: {
     fontSize: '9px', padding: '1px 5px', borderRadius: '3px', flexShrink: 0,
+    background: 'var(--versiondock-badge-background)', color: 'var(--versiondock-badge-foreground)',
+    fontWeight: 'normal', letterSpacing: '0.03em',
+  } as React.CSSProperties,
+  pathBadge: {
+    fontSize: '9px', padding: '1px 5px', borderRadius: '3px', minWidth: 0, maxWidth: '45%',
+    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const,
     background: 'var(--versiondock-badge-background)', color: 'var(--versiondock-badge-foreground)',
     fontWeight: 'normal', letterSpacing: '0.03em',
   } as React.CSSProperties,
