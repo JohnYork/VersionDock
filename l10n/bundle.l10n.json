@@ -2731,5 +2731,19 @@
   "Commit reference cannot be resolved to a commit.": "Commit reference cannot be resolved to a commit.",
   "Leave empty for a lightweight tag; enter a message for an annotated tag.": "Leave empty for a lightweight tag; enter a message for an annotated tag.",
   "Unsupported tag operation: {0}": "Unsupported tag operation: {0}",
-  "Remote": "Remote"
+  "Remote": "Remote",
+  "Generate branch name with AI": "Generate branch name with AI",
+  "Generating branch name…": "Generating branch name…",
+  "AI Branch Name — Task": "AI Branch Name — Task",
+  "Describe your task, or leave empty to generate from current changes.": "Describe your task, or leave empty to generate from current changes.",
+  "e.g. Fix login timeout": "e.g. Fix login timeout",
+  "Describe your task to generate a branch name.": "Describe your task to generate a branch name.",
+  "AI returned an invalid branch name. Retry or enter a name manually.": "AI returned an invalid branch name. Retry or enter a name manually.",
+  "Could not generate branch name: {0}": "Could not generate branch name: {0}",
+  "Git repository is no longer available: {0}": "Git repository is no longer available: {0}",
+  "Invalid Git branch name: {0}": "Invalid Git branch name: {0}",
+  "Branch already exists in {0}: {1}": "Branch already exists in {0}: {1}",
+  "Branch name conflicts with {0} in {1}": "Branch name conflicts with {0} in {1}",
+  "Worktree directory path cannot be empty.": "Worktree directory path cannot be empty.",
+  "Worktree directory already exists. Choose a different path.": "Worktree directory already exists. Choose a different path."
 }

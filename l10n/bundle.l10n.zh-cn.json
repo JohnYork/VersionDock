@@ -2731,5 +2731,19 @@
   "Commit reference cannot be resolved to a commit.": "无法将该引用解析为有效提交。",
   "Leave empty for a lightweight tag; enter a message for an annotated tag.": "留空创建轻量标签；填写说明创建附注标签。",
   "Unsupported tag operation: {0}": "不支持的标签操作：{0}",
-  "Remote": "远程"
+  "Remote": "远程",
+  "Generate branch name with AI": "AI 生成分支名",
+  "Generating branch name…": "正在生成分支名…",
+  "AI Branch Name — Task": "AI 分支命名 — 任务描述",
+  "Describe your task, or leave empty to generate from current changes.": "描述你的任务，或留空根据当前改动生成。",
+  "e.g. Fix login timeout": "例如：修复登录超时",
+  "Describe your task to generate a branch name.": "请描述你的任务，以便生成分支名。",
+  "AI returned an invalid branch name. Retry or enter a name manually.": "AI 返回的分支名无效，请重试或手动填写。",
+  "Could not generate branch name: {0}": "无法生成分支名：{0}",
+  "Git repository is no longer available: {0}": "Git 仓库已不可用：{0}",
+  "Invalid Git branch name: {0}": "Git 分支名无效：{0}",
+  "Branch already exists in {0}: {1}": "{0} 中已存在分支：{1}",
+  "Branch name conflicts with {0} in {1}": "分支名与 {1} 中的 {0} 存在引用路径冲突",
+  "Worktree directory path cannot be empty.": "工作树目录路径不能为空。",
+  "Worktree directory already exists. Choose a different path.": "工作树目录已存在，请选择其他路径。"
 }

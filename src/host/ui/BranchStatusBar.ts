@@ -23,6 +23,8 @@ import { runPushWithProtection } from '../utils/pushProtection';
 import type { UpdateSummaryService } from '../update/UpdateSummaryService';
 import { validateBranchNameInput, sanitizeBranchName } from '../utils/branchNameSanitizer';
 import { isBranchProtected } from '../utils/branchProtection';
+import type { AiBranchNameService } from '../aiBranchName/AiBranchNameService';
+import { promptBranchName } from './promptBranchName';
 
 type SvnIgnoreRepo = {
   addIgnoreEntry(entryPath: string): Promise<{ entry: string; directoryPath: string; alreadyExists: boolean }>;
@@ -109,6 +111,7 @@ export class BranchStatusBar implements vscode.Disposable {
     private readonly commitPanelReveal: () => void,
     private readonly logger: VersionDockLogger,
     private readonly updateSummaryService: UpdateSummaryService,
+    private readonly aiBranchNameService?: AiBranchNameService,
   ) {
     this.statusBarItem = vscode.window.createStatusBarItem(
       vscode.StatusBarAlignment.Left,
@@ -1604,8 +1607,22 @@ export class BranchStatusBar implements vscode.Disposable {
   }
 
   private async newBranch(metas: RepoMeta[]): Promise<void> {
-    // Step 1: branch name
-    const branchName = await vscode.window.showInputBox({
+    // Select targets before reading AI context or validating names.
+    const repoItems = metas.map(m => ({
+      label: formatRepoLabel(m, '$(root-folder)'),
+      description: m.rootPath,
+      picked: true,
+      repoId: m.id,
+    }));
+    const pickedRepos = await vscode.window.showQuickPick(repoItems, {
+      title: t('New Branch — Repositories'),
+      placeHolder: t('Select repos to create the branch in'),
+      canPickMany: true,
+    });
+    if (!pickedRepos || pickedRepos.length === 0) return;
+
+    // Branch name for the selected repositories.
+    const branchName = await promptBranchName(this.aiBranchNameService, pickedRepos.map(item => item.repoId), {
       title: t('New Branch — Name'),
       prompt: t('Enter the new branch name'),
       validateInput: v => validateBranchNameInput(v),
@@ -1613,8 +1630,8 @@ export class BranchStatusBar implements vscode.Disposable {
     if (!branchName) return;
     const sanitizedBranchName = sanitizeBranchName(branchName.trim());
 
-    // Step 2: base branch (from any repo)
-    const allBranches = await this.manager.getAllBranches();
+    // Base branch from the selected repositories.
+    const allBranches = (await this.manager.getAllBranches()).filter(branch => pickedRepos.some(item => item.repoId === branch.repoId));
     const localBranches = allBranches.filter(b => !b.isRemote);
     const uniqueBaseNames = [...new Set(localBranches.map(b => b.name))].sort();
     const currentHeads = [...new Set(localBranches.filter(b => b.isHead).map(b => b.name))];
@@ -1631,20 +1648,6 @@ export class BranchStatusBar implements vscode.Disposable {
     }) as (typeof baseItems[number]) | undefined;
     if (!basePick) return;
     const baseFrom = basePick.value === BASE_CURRENT ? undefined : basePick.value;
-
-    // Step 3: target repos
-    const repoItems = metas.map(m => ({
-      label: formatRepoLabel(m, '$(root-folder)'),
-      description: m.rootPath,
-      picked: true,
-      repoId: m.id,
-    }));
-    const pickedRepos = await vscode.window.showQuickPick(repoItems, {
-      title: t('New Branch — Repositories'),
-      placeHolder: t('Select repos to create the branch in'),
-      canPickMany: true,
-    });
-    if (!pickedRepos || pickedRepos.length === 0) return;
 
     // Step 4: checkout?
     const checkoutPick = await vscode.window.showQuickPick(
@@ -2113,7 +2116,7 @@ export class BranchStatusBar implements vscode.Disposable {
     const repo = this.manager.getRepo(meta.id);
     if (!repo) return;
 
-    const branchName = await vscode.window.showInputBox({
+    const branchName = await promptBranchName(this.aiBranchNameService, [meta.id], {
       title: t('New Branch in {0}', meta.name),
       prompt: t('Enter the new branch name'),
       validateInput: v => validateBranchNameInput(v),
@@ -2369,7 +2372,7 @@ export class BranchStatusBar implements vscode.Disposable {
     const repo = this.manager.getRepo(meta.id);
     if (!repo) return;
 
-    const branchName = await vscode.window.showInputBox({
+    const branchName = await promptBranchName(this.aiBranchNameService, [meta.id], {
       title: t("New Branch from '{0}' in {1}", fromBranch, meta.name),
       prompt: t('Enter the new branch name'),
       validateInput: v => validateBranchNameInput(v),
@@ -2615,7 +2618,21 @@ export class BranchStatusBar implements vscode.Disposable {
   // ── Multi-repo branch actions ────────────────────────────────────────────
 
   private async newBranchFrom(fromBranch: string, metas: RepoMeta[]): Promise<void> {
-    const branchName = await vscode.window.showInputBox({
+    if (metas.length > 1) {
+      const picked = await vscode.window.showQuickPick(metas.map(meta => ({
+        label: formatRepoLabel(meta, '$(root-folder)'),
+        description: meta.rootPath,
+        picked: true,
+        meta,
+      })), {
+        title: t('New Branch — Repositories'),
+        placeHolder: t('Select repos to create the branch in'),
+        canPickMany: true,
+      });
+      if (!picked?.length) return;
+      metas = picked.map(item => item.meta);
+    }
+    const branchName = await promptBranchName(this.aiBranchNameService, metas.map(meta => meta.id), {
       title: t("New Branch from '{0}'", fromBranch),
       prompt: t('Enter the new branch name'),
       validateInput: v => validateBranchNameInput(v),

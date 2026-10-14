@@ -6,6 +6,7 @@ export type AiExecutionMode = 'provider' | 'agent-cli';
 export type AiCliProvider = 'claude' | 'codex' | 'antigravity' | 'opencode';
 export type AiRuntimeProvider = AiProvider | `${AiCliProvider}-cli`;
 export type AiTaskKind =
+  | 'branch-name'
   | 'commit-message'
   | 'commit-explanation'
   | 'code-review'

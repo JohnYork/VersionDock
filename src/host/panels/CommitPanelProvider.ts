@@ -43,6 +43,8 @@ import type { UpdateSummaryService, TrackedUpdateResult } from '../update/Update
 import type { BranchStatusBar } from '../ui/BranchStatusBar';
 import { checkCommitSafety, isSensitivePath } from '../utils/commitSafetyCheck';
 import { sanitizeBranchName, validateBranchNameInput, getBranchCleanCharacter } from '../utils/branchNameSanitizer';
+import type { AiBranchNameService } from '../aiBranchName/AiBranchNameService';
+import { promptBranchName } from '../ui/promptBranchName';
 import { buildPullRequestUrl } from '../utils/prUrlHelper';
 
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
@@ -289,6 +291,7 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
     private readonly workspaceState?: vscode.Memento,
     private readonly logger?: VersionDockLogger,
     private readonly updateSummaryService?: UpdateSummaryService,
+    private readonly aiBranchNameService?: AiBranchNameService,
   ) {
     this.currentTabFileViewMode = this.getFileViewMode();
     this.restoreSubtreeCaches();
@@ -5935,7 +5938,7 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
         }
         const repoName = this.manager.getRepoMeta(msg.repoId)?.name || path.basename(repo.rootPath);
         const shortRef = msg.hash.slice(0, 7);
-        const branchName = await vscode.window.showInputBox({
+        const branchName = await promptBranchName(this.aiBranchNameService, [msg.repoId], {
           prompt: repo.kind === 'svn' ? t('Create SVN branch from revision {0}', shortRef) : t('Create new branch from {0}', shortRef),
           placeHolder: t('my-feature-branch'),
           validateInput: v => validateBranchNameInput(v),
@@ -7126,10 +7129,11 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
         let newBranchName: string | undefined;
         let baseBranchName = picked.branchName;
         if (picked.isNew) {
-          const input = await vscode.window.showInputBox({
+          const input = await promptBranchName(this.aiBranchNameService, [msg.repoId], {
             prompt: t('New branch name'),
             placeHolder: t('e.g. feature/my-feature'),
             title: t('New Worktree — New Branch Name'),
+            validateInput: value => validateBranchNameInput(value),
           });
           if (!input?.trim()) return;
           newBranchName = input.trim();
@@ -7144,6 +7148,16 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
           prompt: t('Path for the new worktree directory'),
           value: defaultPath,
           title: t('New Worktree — Directory Path'),
+          validateInput: async value => {
+            if (!value.trim()) return t('Worktree directory path cannot be empty.');
+            try {
+              await fs.promises.lstat(path.resolve(repoCP.rootPath, value.trim()));
+              return t('Worktree directory already exists. Choose a different path.');
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+              return String(error);
+            }
+          },
         });
         if (!worktreePath?.trim()) return;
 
@@ -7646,7 +7660,7 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
         if (!choice) return false;
         if (choice === createBranchAndCommit) {
           const defaultCleanChar = getBranchCleanCharacter();
-          const newBranchInput = await vscode.window.showInputBox({
+          const newBranchInput = await promptBranchName(this.aiBranchNameService, [repo.repoId], {
             title: t('Create Branch & Commit'),
             prompt: t('Enter new branch name'),
             validateInput: v => validateBranchNameInput(v, defaultCleanChar),
@@ -7728,7 +7742,7 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
     const msg = t('VersionDock [{0}]: You have committed to a detached HEAD. Create a new branch to keep these changes?', repoName);
     void vscode.window.showWarningMessage(msg, createBranchLabel, t('Dismiss')).then(async choice => {
       if (choice === createBranchLabel) {
-        const newBranchName = await vscode.window.showInputBox({
+        const newBranchName = await promptBranchName(this.aiBranchNameService, [repo.repoId], {
           title: t('Create Branch from Current Commit'),
           prompt: t('Enter new branch name'),
           validateInput: v => (v.trim() ? undefined : t('Branch name cannot be empty')),

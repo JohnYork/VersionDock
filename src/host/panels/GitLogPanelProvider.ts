@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import type { AiBranchNameService } from '../aiBranchName/AiBranchNameService';
+import { promptBranchName } from '../ui/promptBranchName';
 import { getGitTagWorkflow } from '../tags/GitTagWorkflow';
 import type { TagWorkflowRequest } from '../types/tags';
 import { registerWebviewScrollbars } from '../utils/webviewScrollbars';
@@ -243,6 +245,7 @@ export class GitLogPanelProvider implements vscode.WebviewViewProvider, vscode.D
     private readonly aiCommitExplanationService: AiCommitExplanationService,
     private readonly logger: VersionDockLogger,
     private readonly updateSummaryService: UpdateSummaryService,
+    private readonly aiBranchNameService?: AiBranchNameService,
   ) {
     this.shelveDocProvider.setContentResolver(async (repoId, shelveId, filePath) => {
       if (shelveId === 'empty' || !shelveId) return '';
@@ -2388,7 +2391,7 @@ export class GitLogPanelProvider implements vscode.WebviewViewProvider, vscode.D
         if (!repo) { this.post({ type: 'LOG_BRANCH_OP_RESULT', requestId: msg.requestId, ok: false, error: t('Repo not found') }); return; }
         const repoName = this.manager.getRepoMeta(msg.repoId)?.name || path.basename(repo.rootPath) || msg.repoId;
         const shortRef = msg.hash.slice(0, 7);
-        const branchName = await vscode.window.showInputBox({
+        const branchName = await promptBranchName(this.aiBranchNameService, [msg.repoId], {
           prompt: repo.kind === 'svn' ? t('Create SVN branch from revision {0}', shortRef) : t('Create new branch from {0}', shortRef),
           placeHolder: t('my-feature-branch'),
           validateInput: v => validateBranchNameInput(v),

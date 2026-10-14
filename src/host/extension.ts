@@ -16,6 +16,7 @@ import { t, setMultiRepoProvider } from './utils/l10n';
 import { setMixedRepoWorkspaceProvider } from './utils/repoLabels';
 import { VersionDockLogger } from './utils/Logger';
 import { AiProviderService } from './ai/AiProviderService';
+import { AiBranchNameService } from './aiBranchName/AiBranchNameService';
 import { AiCommitMessageService } from './aiCommitMessage/AiCommitMessageService';
 import { AiMergeConflictService } from './aiMergeConflict/AiMergeConflictService';
 import { AiCommitExplanationService } from './aiCommitExplanation/AiCommitExplanationService';
@@ -169,6 +170,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const profileService = new GitProfileService(context, logger);
   const aiProviderService = new AiProviderService(context, logger);
+  const aiBranchNameService = new AiBranchNameService(manager, aiProviderService);
   const aiCommitMessageService = new AiCommitMessageService(context, aiProviderService);
   const aiMergeConflictService = new AiMergeConflictService(context, aiProviderService, logger);
   const aiCommitExplanationService = new AiCommitExplanationService(context, aiProviderService);
@@ -189,7 +191,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     logger,
   );
 
-  const commitPanel = new CommitPanelProvider(context.extensionUri, manager, context.globalStorageUri.fsPath, shelveDocProvider, aiCommitMessageService, undefined, profileService, context.globalState, context.workspaceState, logger, updateSummaryService);
+  const commitPanel = new CommitPanelProvider(context.extensionUri, manager, context.globalStorageUri.fsPath, shelveDocProvider, aiCommitMessageService, undefined, profileService, context.globalState, context.workspaceState, logger, updateSummaryService, aiBranchNameService);
 
   const unpushedCommitsNotifier = new UnpushedCommitsNotifier(
     manager,
@@ -197,7 +199,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     logger,
   );
 
-  const logPanel = new GitLogPanelProvider(context.extensionUri, manager, shelveDocProvider, aiCommitMessageService, aiCommitExplanationService, logger, updateSummaryService);
+  const logPanel = new GitLogPanelProvider(context.extensionUri, manager, shelveDocProvider, aiCommitMessageService, aiCommitExplanationService, logger, updateSummaryService, aiBranchNameService);
   const mergeEditor = new MergeEditorProvider(context.extensionUri, manager, aiMergeConflictService, logger);
   const conflictsPanel = new ConflictsPanelProvider(context.extensionUri, manager, mergeEditor, logger);
   const aiCommitComposer = new AiCommitComposerProvider(context.extensionUri, manager, aiCommitComposerService, aiCommitMessageService, logger);
@@ -222,7 +224,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const branchStatusBar = new BranchStatusBar(manager, () => {
     vscode.commands.executeCommand('versiondock.commitPanel.focus');
-  }, logger, updateSummaryService);
+  }, logger, updateSummaryService, aiBranchNameService);
   commitPanel.setBranchStatusBar(branchStatusBar);
 
   const profileStatusBar = new ProfileStatusBar(profileService, manager, logger, remoteRepositoryService);

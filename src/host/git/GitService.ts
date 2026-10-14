@@ -3610,6 +3610,24 @@ export class GitService {
     }, 'checkout', branchName);
   }
 
+  /** Read-only preflight; the eventual writer still checks concurrent ref changes. */
+  async validateNewBranchName(name: string): Promise<string | undefined> {
+    try {
+      await this.rawPathSafe(['check-ref-format', '--branch', name]);
+    } catch {
+      return t('Invalid Git branch name: {0}', name);
+    }
+    const refs = await this.rawPathSafe(['for-each-ref', '--format=%(refname)', 'refs/heads/']);
+    const target = `refs/heads/${name}`;
+    for (const ref of refs.trim().split('\n')) {
+      if (ref === target) return t('Branch already exists in {0}: {1}', path.basename(this.rootPath), name);
+      if (ref.startsWith(`${target}/`) || target.startsWith(`${ref}/`)) {
+        return t('Branch name conflicts with {0} in {1}', ref.slice('refs/heads/'.length), path.basename(this.rootPath));
+      }
+    }
+    return undefined;
+  }
+
   async createBranch(branchName: string, from?: string): Promise<void> {
     return this.withWriteLock(async () => {
     const vsRepo = this.vsRepo();
@@ -5680,8 +5698,16 @@ export class GitService {
   }
 
   async createWorktree(worktreePath: string, opts: { branch?: string; newBranch?: string; commitish?: string; noTrack?: boolean }): Promise<void> {
+    // Git interprets relative worktree paths from the repository, not the host cwd.
+    const targetPath = path.resolve(this.rootPath, worktreePath);
     return this.runStatusSensitiveOperation(async () => {
-      return withGitWriteLocks([this.rootPath, worktreePath], async () => {
+      return withGitWriteLocks([this.rootPath, targetPath], async () => {
+        try {
+          await fs.promises.lstat(targetPath);
+          throw new Error(t('Worktree directory already exists. Choose a different path.'));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
         const args = ['worktree', 'add'];
         if (opts.newBranch) {
           args.push('-b', opts.newBranch);
@@ -5689,7 +5715,7 @@ export class GitService {
           // checkout existing branch — no -b flag, just add path + branch
         }
         if (opts.noTrack) args.push('--no-track');
-        args.push(worktreePath);
+        args.push(targetPath);
         if (opts.branch) args.push(opts.branch);
         else if (opts.commitish) args.push(opts.commitish);
         await this.git.raw(args);
