@@ -1,9 +1,8 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { GitService, type MergeCommitResult, parseGitmodulesFileSync } from './GitService';
+import { GitService, isSameWorktreePath, type MergeCommitResult, type WorktreeEntry, parseGitmodulesFileSync } from './GitService';
 import { SvnService } from '../svn/SvnService';
-import type { WorktreeEntry } from './GitService';
 import { getVscodeGitApi, getVscodeRepository } from './VscodeGitApi';
 import type { BranchInfo, CommitNode, CommitLogList, GraphCommitNode, LineRange, RepoMeta, RepoStatus, RepoSubmodules, SubmoduleItem, WorkspaceStatus } from '../types/git';
 import { PROJECT_COLORS } from '../types/workspace';
@@ -1734,9 +1733,9 @@ export class WorkspaceGitManager implements vscode.Disposable {
     try { return await repo.getWorktrees(); } catch { return []; }
   }
 
-  async getAllWorktrees(): Promise<Array<{ repoId: string; repoName: string; repoColor: string; worktrees: WorktreeEntry[]; isLinkedWorktree: boolean }>> {
+  async getAllWorktrees(): Promise<Array<{ repoId: string; repoName: string; repoColor: string; worktrees: WorktreeEntry[]; isLinkedWorktree: boolean; error?: string }>> {
     const workspacePaths = (vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath);
-    const results: Array<{ repoId: string; repoName: string; repoColor: string; worktrees: WorktreeEntry[]; isLinkedWorktree: boolean }> = [];
+    const results: Array<{ repoId: string; repoName: string; repoColor: string; worktrees: WorktreeEntry[]; isLinkedWorktree: boolean; error?: string }> = [];
     for (const [repoId, repo] of this.repos) {
       const meta = this.repoMetas.get(repoId);
       if (!meta) continue;
@@ -1751,10 +1750,11 @@ export class WorkspaceGitManager implements vscode.Disposable {
         const worktrees = (await repo.getWorktrees()).map(w => ({
           ...w,
           isInWorkspace: workspacePaths.some(wp => isWithinPath(wp, w.path)),
+          isCurrent: isSameWorktreePath(meta.rootPath, w.path),
         }));
         results.push({ repoId, repoName: meta.name, repoColor: meta.color, worktrees, isLinkedWorktree });
-      } catch {
-        results.push({ repoId, repoName: meta.name, repoColor: meta.color, worktrees: [], isLinkedWorktree });
+      } catch (error) {
+        results.push({ repoId, repoName: meta.name, repoColor: meta.color, worktrees: [], isLinkedWorktree, error: String(error) });
       }
     }
     return results;

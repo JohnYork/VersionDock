@@ -7,12 +7,59 @@ import { type SimpleGit } from 'simple-git';
 import type { ShelveEntry } from '../types/messages';
 import { t } from '../utils/l10n';
 import { createGitClient, withGitWriteLock } from './GitOperationLock';
+import { assertNoSymlinkAncestors } from '../utils/repoPath';
 import type { SuppressStatusUpdates } from './GitService';
 
 type ChangelistAssignment = NonNullable<ShelveEntry['changelistAssignments']>[number];
 
 const META_FILE = 'shelves.json';
 const MAX_SYNTHETIC_TEXT_PATCH_BYTES = 8 * 1024 * 1024;
+
+/** Worktree removal also removes its private Git directory and shelf attachments. */
+export function getStoredShelfCount(gitDir: string): number {
+  const directory = path.join(gitDir, 'versiondock', 'shelves');
+  if (fs.existsSync(path.join(directory, '.lock'))) {
+    throw new Error(t('Shelf storage is busy: {0}', directory));
+  }
+  return readStoredShelfCount(directory);
+}
+
+function readStoredShelfCount(directory: string): number {
+  const metaPath = path.join(directory, META_FILE);
+  if (!fs.existsSync(metaPath)) return 0;
+  const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')) as { shelves?: unknown };
+  if (!Array.isArray(meta.shelves)) throw new Error(t('Cannot read worktree shelves. Removal was cancelled.'));
+  return meta.shelves.length;
+}
+
+/** Hold the existing Desktop/extension storage lock until Git removes the registration. */
+export async function withShelfRemovalGuard<T>(gitDir: string, operation: () => Promise<T>): Promise<T> {
+  const directory = path.join(gitDir, 'versiondock', 'shelves');
+  assertNoSymlinkAncestors(gitDir, directory, { includeTarget: true });
+  fs.mkdirSync(directory, { recursive: true });
+  const lockPath = path.join(directory, '.lock');
+  try { fs.mkdirSync(lockPath); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error(t('Shelf storage is busy: {0}', directory));
+    throw error;
+  }
+  const ownedLock = fs.statSync(lockPath);
+  let result: T;
+  let cleanupError: unknown;
+  try {
+    const count = readStoredShelfCount(directory);
+    if (count) throw new Error(t('This worktree contains {0} shelves. Restore or move them before removing it.', count));
+    result = await operation();
+  } finally {
+    try {
+      const currentLock = fs.lstatSync(lockPath);
+      if (currentLock.dev === ownedLock.dev && currentLock.ino === ownedLock.ino) fs.rmdirSync(lockPath);
+    }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') cleanupError = error; }
+  }
+  if (cleanupError) throw cleanupError;
+  return result;
+}
 
 interface BinaryFile {
   repoRelPath: string;   // path relative to repo root

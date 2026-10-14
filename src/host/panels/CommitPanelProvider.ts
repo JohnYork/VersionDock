@@ -45,6 +45,7 @@ import { checkCommitSafety, isSensitivePath } from '../utils/commitSafetyCheck';
 import { sanitizeBranchName, validateBranchNameInput, getBranchCleanCharacter } from '../utils/branchNameSanitizer';
 import type { AiBranchNameService } from '../aiBranchName/AiBranchNameService';
 import { promptBranchName } from '../ui/promptBranchName';
+import { GitWorktreeWorkflow } from '../git/GitWorktreeWorkflow';
 import { buildPullRequestUrl } from '../utils/prUrlHelper';
 
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
@@ -244,6 +245,8 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
     });
   }
   private shelveServices = new Map<string, ShelveService>();
+  private readonly worktreeWorkflow: GitWorktreeWorkflow;
+  private worktreeInteractionActive = false;
   private subtreeStatusCache = new Map<string, CachedSubtreeStatus>();
   private subtreeStatusTasks = new Map<string, { key: string; task: Promise<SubtreePushStatus> }>();
   private notifiedSubtreeUpdateKeys = new Map<string, string>();
@@ -267,6 +270,16 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
       );
     }
     return this.shelveServices.get(repoId);
+  }
+
+  private async runWorktreeInteraction<T>(operation: () => Promise<T>): Promise<T | undefined> {
+    if (this.worktreeInteractionActive) {
+      await vscode.window.showInformationMessage(t('A worktree operation is already in progress.'));
+      return undefined;
+    }
+    this.worktreeInteractionActive = true;
+    try { return await operation(); }
+    finally { this.worktreeInteractionActive = false; }
   }
 
   private updateVcsContext(metas: RepoMeta[] = this.manager.getRepoMetas()): void {
@@ -293,6 +306,7 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
     private readonly updateSummaryService?: UpdateSummaryService,
     private readonly aiBranchNameService?: AiBranchNameService,
   ) {
+    this.worktreeWorkflow = new GitWorktreeWorkflow(this.aiBranchNameService);
     this.currentTabFileViewMode = this.getFileViewMode();
     this.restoreSubtreeCaches();
     this.knownRepoIds = new Set(this.manager.getRepoMetas().map(m => m.id));
@@ -7099,83 +7113,25 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
 
       case 'WORKTREE_REQUEST_LIST': {
         const repos = await this.manager.getAllWorktrees();
-        this.post({ type: 'WORKTREE_LIST_RESULT', repos });
+        this.post({ type: 'WORKTREE_LIST_RESULT', requestId: msg.requestId, repos });
         break;
       }
 
       case 'WORKTREE_CREATE_PROMPT': {
-        const repoCP = this.manager.getRepo(msg.repoId);
-        if (!repoCP) return;
-
-        // Step 1: pick branch or "new branch"
-        const branches = await repoCP.getBranches();
-        const NEW_BRANCH_ID = '__new__';
-        const branchItems: Array<{ label: string; description?: string; branchName: string; isNew?: boolean }> = [
-          { label: `$(add) ${t('Create new branch…')}`, branchName: NEW_BRANCH_ID, isNew: true },
-          ...branches.map(b => ({
-            label: b.isRemote ? `$(cloud) ${b.name}` : `$(git-branch) ${b.name}`,
-            description: b.isHead ? t('(current)') : undefined,
-            branchName: b.name,
-          })),
-        ];
-        const picked = await vscode.window.showQuickPick(branchItems, {
-          placeHolder: t('Select branch for new worktree'),
-          title: t('New Worktree — Branch'),
-          matchOnDescription: true,
-        });
-        if (!picked) return;
-
-        // If "new branch" chosen, ask for the name
-        let newBranchName: string | undefined;
-        let baseBranchName = picked.branchName;
-        if (picked.isNew) {
-          const input = await promptBranchName(this.aiBranchNameService, [msg.repoId], {
-            prompt: t('New branch name'),
-            placeHolder: t('e.g. feature/my-feature'),
-            title: t('New Worktree — New Branch Name'),
-            validateInput: value => validateBranchNameInput(value),
-          });
-          if (!input?.trim()) return;
-          newBranchName = input.trim();
-          baseBranchName = newBranchName;
+        const repo = this.manager.getRepo(msg.repoId);
+        if (!repo) {
+          if (msg.requestId) this.post({ type: 'WORKTREE_OP_RESULT', requestId: msg.requestId, repoId: msg.repoId, op: 'create', ok: false, error: t('Repo not found') });
+          return;
         }
-
-        // Step 2: worktree path — format: <repo-folder-name>--<branch-name>
-        const repoParent = path.dirname(repoCP.rootPath);
-        const repoFolderName = path.basename(repoCP.rootPath);
-        const defaultPath = path.join(repoParent, `${repoFolderName}--${baseBranchName.replace(/\//g, '-')}`);
-        const worktreePath = await vscode.window.showInputBox({
-          prompt: t('Path for the new worktree directory'),
-          value: defaultPath,
-          title: t('New Worktree — Directory Path'),
-          validateInput: async value => {
-            if (!value.trim()) return t('Worktree directory path cannot be empty.');
-            try {
-              await fs.promises.lstat(path.resolve(repoCP.rootPath, value.trim()));
-              return t('Worktree directory already exists. Choose a different path.');
-            } catch (error) {
-              if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-              return String(error);
-            }
-          },
-        });
-        if (!worktreePath?.trim()) return;
-
-        const repoName = this.manager.getRepoMeta(repoCP.repoId)?.name || repoFolderName;
+        const repoName = this.manager.getRepoMeta(msg.repoId)?.name || path.basename(repo.rootPath);
         try {
-          await vscode.window.withProgress(
-            { location: vscode.ProgressLocation.Notification, title: t('VersionDock [{0}]: Creating worktree…', repoName), cancellable: false },
-            async () => {
-              await repoCP.createWorktree(worktreePath.trim(), {
-                branch: picked.isNew ? undefined : picked.branchName,
-                newBranch: newBranchName,
-              });
-            }
-          );
-          const repos = await this.manager.getAllWorktrees();
-          this.post({ type: 'WORKTREE_LIST_RESULT', repos });
-          vscode.window.showInformationMessage(t('VersionDock [{0}]: Worktree created at {1}', repoName, worktreePath.trim()));
+          const created = await this.runWorktreeInteraction(() => this.worktreeWorkflow.create(repo, repoName, async () => {
+            const repos = await this.manager.getAllWorktrees();
+            this.post({ type: 'WORKTREE_LIST_RESULT', repos });
+          }));
+          if (msg.requestId) this.post({ type: 'WORKTREE_OP_RESULT', requestId: msg.requestId, repoId: msg.repoId, op: 'create', ok: Boolean(created), error: created ? undefined : 'Cancelled' });
         } catch (e: unknown) {
+          if (msg.requestId) this.post({ type: 'WORKTREE_OP_RESULT', requestId: msg.requestId, repoId: msg.repoId, op: 'create', ok: false, error: 'Cancelled' });
           void showGitErrorMessage(t('VersionDock [{0}]: Failed to create worktree — {1}', repoName, String(e)), {
             repoName,
             onUnlocked: async () => {
@@ -7211,7 +7167,11 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
           return;
         }
         try {
-          await repoWD.deleteWorktree(msg.worktreePath, msg.force);
+          const removed = await this.runWorktreeInteraction(() => this.worktreeWorkflow.remove(repoWD, msg.worktreePath, msg.force));
+          if (!removed) {
+            this.post({ type: 'WORKTREE_OP_RESULT', requestId: msg.requestId, repoId: msg.repoId, op: 'delete', ok: false, error: 'Cancelled' });
+            break;
+          }
           this.post({ type: 'WORKTREE_OP_RESULT', requestId: msg.requestId, repoId: msg.repoId, op: 'delete', ok: true });
           const repos = await this.manager.getAllWorktrees();
           this.post({ type: 'WORKTREE_LIST_RESULT', repos });
@@ -7288,9 +7248,8 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
       }
 
       case 'WORKTREE_ADD_TO_WORKSPACE': {
-        const uri = vscode.Uri.file(msg.worktreePath);
-        const folders = vscode.workspace.workspaceFolders ?? [];
-        vscode.workspace.updateWorkspaceFolders(folders.length, 0, { uri });
+        try { await this.worktreeWorkflow.addToWorkspace(msg.worktreePath); }
+        catch (error) { void vscode.window.showErrorMessage(String(error)); }
         break;
       }
 

@@ -29,6 +29,7 @@ import { BlameService, type BlameLine } from './BlameService';
 import { assertNoSymlinkAncestors, isSameOrChildPath, resolveRepoPath as resolvePathWithinRepo, type ResolvedRepoPath } from '../utils/repoPath';
 import { createGitClient, getGitEnvironment, getGitWriteGeneration, waitForGitWrite, withGitWriteLock, withGitWriteLocks } from './GitOperationLock';
 import { isBranchProtected } from '../utils/branchProtection';
+import { getStoredShelfCount, withShelfRemovalGuard } from './ShelveService';
 import type { PublishMissingRemote } from '../remote/types';
 import type { GitUpdateSnapshot, VcsUpdateSnapshot } from '../update/types';
 import type { VersionDockLogger } from '../utils/Logger';
@@ -5693,7 +5694,7 @@ export class GitService {
   // ─── Worktree operations ──────────────────────────────────────────────────
 
   async getWorktrees(): Promise<WorktreeEntry[]> {
-    const raw = await this.git.raw(['worktree', 'list', '--porcelain']);
+    const raw = await this.git.raw(['worktree', 'list', '--porcelain', '-z']);
     return parseWorktreePorcelain(raw);
   }
 
@@ -5709,33 +5710,124 @@ export class GitService {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
         }
         const args = ['worktree', 'add'];
-        if (opts.newBranch) {
-          args.push('-b', opts.newBranch);
-        } else if (opts.branch) {
-          // checkout existing branch — no -b flag, just add path + branch
+        const branches = await this.getBranches();
+        let branch = opts.branch;
+        let newBranch = opts.newBranch;
+        let startPoint = opts.commitish;
+        let track = false;
+        if (branch && !newBranch) {
+          const selected = branches.find(b => b.name === branch && !b.isRemote)
+            ?? branches.find(b => b.name === branch && b.isRemote);
+          if (!selected) throw new Error(t('Branch not found: {0}', branch));
+          if (selected.isRemote) {
+            const localName = selected.name.slice((selected.remoteName?.length ?? selected.name.indexOf('/')) + 1);
+            if (!localName) throw new Error(t('Cannot determine a local branch name for {0}.', branch));
+            if (branches.some(b => !b.isRemote && b.name === localName)) {
+              branch = localName;
+            } else {
+              newBranch = localName;
+              startPoint = selected.fullName;
+              track = !opts.noTrack;
+              branch = undefined;
+            }
+          }
         }
+        if (newBranch) {
+          const error = await this.validateNewBranchName(newBranch);
+          if (error) throw new Error(error);
+        } else if (branch) {
+          const occupied = (await this.getWorktrees()).find(w => w.branchShort === branch);
+          if (occupied) throw new Error(t('Branch "{0}" is already used by worktree at {1}.', branch, occupied.path));
+        }
+        if (newBranch) args.push('-b', newBranch);
+        if (track) args.push('--track');
         if (opts.noTrack) args.push('--no-track');
         args.push(targetPath);
-        if (opts.branch) args.push(opts.branch);
-        else if (opts.commitish) args.push(opts.commitish);
+        if (newBranch) args.push(this.safeRevisionArg(startPoint ?? branch ?? 'HEAD'));
+        else if (branch) args.push(this.safeRevisionArg(branch));
+        else if (startPoint) args.push(this.safeRevisionArg(startPoint));
         await this.git.raw(args);
       });
     }, 'checkout', worktreePath);
   }
 
   async deleteWorktree(worktreePath: string, force = false): Promise<void> {
+    const targetPath = path.resolve(this.rootPath, worktreePath);
     return this.runStatusSensitiveOperation(async () => {
-      return withGitWriteLocks([this.rootPath, worktreePath], async () => {
+      return withGitWriteLocks([this.rootPath, targetPath], async () => {
+        // Recheck under the write locks; UI confirmation cannot replace writer guards.
+        const info = await this.getWorktreeRemovalInfo(targetPath);
+        if (info.shelfCount) throw new Error(t('This worktree contains {0} shelves. Restore or move them before removing it.', info.shelfCount));
+        if (!force && (info.changedCount || info.ignoredCount)) {
+          throw new Error(t('Worktree contains local files or changes. Open it to save them, or explicitly confirm force removal.'));
+        }
         const args = ['worktree', 'remove'];
         if (force) args.push('--force');
-        args.push(worktreePath);
-        await this.git.raw(args);
+        args.push(info.entry.path);
+        await withShelfRemovalGuard(info.gitDir, () => this.git.raw(args));
       });
     }, 'sync', worktreePath);
   }
 
+  async getWorktreeRemovalInfo(worktreePath: string): Promise<WorktreeRemovalInfo> {
+    const targetPath = path.resolve(this.rootPath, worktreePath);
+    const entry = (await this.getWorktrees()).find(w => isSameWorktreePath(w.path, targetPath));
+    if (!entry) throw new Error(t('Worktree not found: {0}', targetPath));
+    if (entry.isMain || isSameWorktreePath(entry.path, this.rootPath)) {
+      throw new Error(t('Cannot remove the main or currently opened worktree.'));
+    }
+    if (entry.isLocked) throw new Error(t('Unlock the worktree before removing it.'));
+    if (entry.isDetached && entry.head) {
+      const uniqueCommits = Number((await this.git.raw(['rev-list', '--count', entry.head, '--not', '--branches', '--remotes', '--tags'])).trim());
+      if (uniqueCommits > 0) throw new Error(t('This detached worktree contains commits not saved on a branch or tag. Create a branch before removing it.'));
+    }
+    if (!fs.existsSync(entry.path)) {
+      // Shelves remain in the registration even when the checkout was moved/deleted externally.
+      const commonDir = (await this.git.raw(['rev-parse', '--path-format=absolute', '--git-common-dir'])).replace(/\r?\n$/, '');
+      const registrations = path.join(commonDir, 'worktrees');
+      for (const name of await fs.promises.readdir(registrations)) {
+        const gitDir = path.join(registrations, name);
+        const pointer = (await fs.promises.readFile(path.join(gitDir, 'gitdir'), 'utf8')).replace(/\r?\n$/, '');
+        if (isSameWorktreePath(path.dirname(pointer), entry.path)) {
+          return { entry, gitDir, changedCount: 0, ignoredCount: 0, shelfCount: getStoredShelfCount(gitDir) };
+        }
+      }
+      throw new Error(t('Cannot read worktree shelves. Removal was cancelled.'));
+    }
+    const client = createGitClient(entry.path);
+    const [raw, gitDir] = await Promise.all([
+      client.raw(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching']),
+      client.raw(['rev-parse', '--absolute-git-dir']),
+    ]);
+    let changedCount = 0;
+    let ignoredCount = 0;
+    const records = raw.split('\0');
+    for (let i = 0; i < records.length; i++) {
+      const code = records[i].slice(0, 2);
+      if (!code) continue;
+      if (code === '!!') ignoredCount++;
+      else changedCount++;
+      if (code.includes('R') || code.includes('C')) i++;
+    }
+    const resolvedGitDir = gitDir.replace(/\r?\n$/, '');
+    return { entry, gitDir: resolvedGitDir, changedCount, ignoredCount, shelfCount: getStoredShelfCount(resolvedGitDir) };
+  }
+
   async pruneWorktrees(): Promise<void> {
-    return this.runStatusSensitiveOperation(() => this.git.raw(['worktree', 'prune']).then(() => undefined), 'sync', 'prune worktrees');
+    return this.runStatusSensitiveOperation(async () => {
+      const gitDirs: string[] = [];
+      for (const entry of await this.getWorktrees()) {
+        if (!entry.isPrunable || entry.isMain || entry.isLocked) continue;
+        const info = await this.getWorktreeRemovalInfo(entry.path);
+        if (info.shelfCount) throw new Error(t('This worktree contains {0} shelves. Restore or move them before removing it.', info.shelfCount));
+        gitDirs.push(info.gitDir);
+      }
+      const prune = async (index: number): Promise<void> => {
+        if (index === gitDirs.length) { await this.git.raw(['worktree', 'prune']); return; }
+        await withShelfRemovalGuard(gitDirs[index], () => prune(index + 1));
+      };
+      await prune(0);
+    }, 'sync', 'prune worktrees');
   }
 
   async lockWorktree(worktreePath: string, reason?: string): Promise<void> {
@@ -5765,18 +5857,36 @@ export interface WorktreeEntry {
   lockReason?: string;
   isPrunable: boolean;
   branchShort: string; // just the branch name without refs/heads/
+  isCurrent?: boolean; // checkout backing the current repository section
   isInWorkspace: boolean; // path is inside a VS Code workspace folder
+}
+
+export interface WorktreeRemovalInfo {
+  entry: WorktreeEntry;
+  gitDir: string;
+  changedCount: number;
+  ignoredCount: number;
+  shelfCount: number;
+}
+
+export function isSameWorktreePath(a: string, b: string): boolean {
+  const canonical = (value: string): string => {
+    let resolved = path.resolve(value);
+    try { resolved = fs.realpathSync.native(resolved); } catch { /* missing/prunable directory */ }
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  return canonical(a) === canonical(b);
 }
 
 function parseWorktreePorcelain(raw: string): WorktreeEntry[] {
   const entries: WorktreeEntry[] = [];
-  const blocks = raw.trim().split(/\n\n+/);
+  const blocks = raw.split('\0\0');
   for (const block of blocks) {
     if (!block.trim()) continue;
-    const lines = block.split('\n');
-    const entry: Partial<WorktreeEntry> = { isLocked: false, isPrunable: false };
+    const lines = block.split('\0');
+    const entry: Partial<WorktreeEntry> = { head: '', branch: '', isLocked: false, isPrunable: false };
     for (const line of lines) {
-      if (line.startsWith('worktree '))      entry.path = line.slice(9).trim();
+      if (line.startsWith('worktree '))      entry.path = line.slice(9);
       else if (line.startsWith('HEAD '))     entry.head = line.slice(5).trim();
       else if (line.startsWith('branch '))   entry.branch = line.slice(7).trim();
       else if (line === 'bare')              entry.isBare = true;
@@ -5785,12 +5895,8 @@ function parseWorktreePorcelain(raw: string): WorktreeEntry[] {
       else if (line.startsWith('prunable'))  entry.isPrunable = true;
     }
     if (!entry.path) continue;
-    // The main worktree has a .git directory; linked worktrees have a .git file.
-    // Checking the entry itself avoids macOS path aliases such as /var vs /private/var.
-    const gitDir = path.join(entry.path, '.git');
-    entry.isMain = (() => {
-      try { return fs.statSync(gitDir).isDirectory(); } catch { return false; }
-    })();
+    // Git lists the main worktree first, including bare and missing main directories.
+    entry.isMain = entries.length === 0;
     entry.isBare = entry.isBare ?? false;
     entry.isDetached = entry.isDetached ?? false;
     entry.isInWorkspace = false;

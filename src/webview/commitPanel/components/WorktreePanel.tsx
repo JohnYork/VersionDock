@@ -11,6 +11,7 @@ interface RepoWorktrees {
   repoColor: string;
   worktrees: WorktreeEntry[];
   isLinkedWorktree: boolean;
+  error?: string;
 }
 
 interface Props {
@@ -18,6 +19,8 @@ interface Props {
   loading: boolean;
   error: string | null;
   multiRepo: boolean;
+  busyRepoIds: Set<string>;
+  onRefresh: () => void;
   onDelete: (repoId: string, worktreePath: string, force: boolean) => void;
   onLock: (repoId: string, worktreePath: string) => void;
   onUnlock: (repoId: string, worktreePath: string) => void;
@@ -29,22 +32,22 @@ interface Props {
   onRequestCreate: (repoId: string) => void;
 }
 
-function ctxItems(entry: WorktreeEntry): ContextMenuEntry[] {
+function ctxItems(entry: WorktreeEntry, busy: boolean): ContextMenuEntry[] {
   const items: ContextMenuEntry[] = [
     ...(entry.isInWorkspace ? [{ id: 'explorer', label: t('Reveal in Explorer'), icon: 'folder-opened' } as ContextMenuEntry] : []),
     { id: 'newwindow',  label: t('Open in New Window'),        icon: 'link-external' },
     { id: 'os',         label: t('Open in File Manager'),      icon: 'folder' },
     ...(!entry.isInWorkspace ? [{ id: 'add-to-workspace', label: t('Add Folder to Workspace'), icon: 'add' } as ContextMenuEntry] : []),
   ];
-  if (!entry.isMain) {
+  if (!entry.isMain && !entry.isCurrent) {
     items.push(
       { separator: true },
       entry.isLocked
-        ? { id: 'unlock', label: t('Unlock'),        icon: 'unlock' }
-        : { id: 'lock',   label: t('Lock'),          icon: 'lock' },
+        ? { id: 'unlock', label: t('Unlock'),        icon: 'unlock', disabled: busy }
+        : { id: 'lock',   label: t('Lock'),          icon: 'lock', disabled: busy },
       { separator: true },
-      { id: 'delete',       label: t('Remove Worktree'), icon: 'trash', danger: true },
-      { id: 'force-delete', label: t('Force Remove'),    icon: 'trash', danger: true },
+      { id: 'delete',       label: t('Remove Worktree'), icon: 'trash', danger: true, disabled: busy || entry.isLocked },
+      { id: 'force-delete', label: t('Force Remove'),    icon: 'trash', danger: true, disabled: busy || entry.isLocked },
     );
   }
   return items;
@@ -72,10 +75,11 @@ function worktreePathTags(worktrees: WorktreeEntry[]): Map<string, string> {
   }));
 }
 
-function WorktreeRow({ entry, pathTag, repoId, onDelete, onLock, onUnlock, onOpenInExplorer, onOpenInNewWindow, onOpenInOS, onAddToWorkspace }: {
+function WorktreeRow({ entry, pathTag, repoId, busy, onDelete, onLock, onUnlock, onOpenInExplorer, onOpenInNewWindow, onOpenInOS, onAddToWorkspace }: {
   entry: WorktreeEntry;
   pathTag: string;
   repoId: string;
+  busy: boolean;
   onDelete: Props['onDelete'];
   onLock: Props['onLock'];
   onUnlock: Props['onUnlock'];
@@ -160,13 +164,14 @@ function WorktreeRow({ entry, pathTag, repoId, onDelete, onLock, onUnlock, onOpe
             >
               <Codicon name="link-external" />
             </button>
-            {!entry.isMain && (
+            {!entry.isMain && !entry.isCurrent && (
               <>
                 {entry.isLocked ? (
                   <button
                     data-action-btn=""
                     style={row.btn}
                     title={t('Unlock worktree')}
+                    disabled={busy}
                     onClick={e => { e.stopPropagation(); onUnlock(repoId, entry.path); }}
                   >
                     <Codicon name="unlock" />
@@ -176,6 +181,7 @@ function WorktreeRow({ entry, pathTag, repoId, onDelete, onLock, onUnlock, onOpe
                     data-action-btn=""
                     style={row.btn}
                     title={t('Lock worktree')}
+                    disabled={busy}
                     onClick={e => { e.stopPropagation(); onLock(repoId, entry.path); }}
                   >
                     <Codicon name="lock" />
@@ -185,6 +191,7 @@ function WorktreeRow({ entry, pathTag, repoId, onDelete, onLock, onUnlock, onOpe
                   data-action-btn=""
                   style={{ ...row.btn, color: 'var(--vscode-errorForeground)' }}
                   title={t('Remove worktree')}
+                  disabled={busy || entry.isLocked}
                   onClick={e => { e.stopPropagation(); onDelete(repoId, entry.path, false); }}
                 >
                   <Codicon name="trash" />
@@ -198,7 +205,7 @@ function WorktreeRow({ entry, pathTag, repoId, onDelete, onLock, onUnlock, onOpe
       {ctxMenu && (
         <ContextMenu
           x={ctxMenu.x} y={ctxMenu.y}
-          items={ctxItems(entry)}
+          items={ctxItems(entry, busy)}
           onSelect={id => {
             setCtxMenu(null);
             if (id === 'explorer')        onOpenInExplorer(repoId, entry.path);
@@ -219,9 +226,11 @@ function WorktreeRow({ entry, pathTag, repoId, onDelete, onLock, onUnlock, onOpe
 
 // ── Per-repo section ──────────────────────────────────────────────────────────
 
-function RepoSection({ repo, multiRepo, onDelete, onLock, onUnlock, onPrune, onOpenInExplorer, onOpenInNewWindow, onOpenInOS, onAddToWorkspace, onRequestCreate, isFirst = false }: {
+function RepoSection({ repo, multiRepo, busy, onRefresh, onDelete, onLock, onUnlock, onPrune, onOpenInExplorer, onOpenInNewWindow, onOpenInOS, onAddToWorkspace, onRequestCreate, isFirst = false }: {
   repo: RepoWorktrees;
   multiRepo: boolean;
+  busy: boolean;
+  onRefresh: Props['onRefresh'];
   onDelete: Props['onDelete'];
   onLock: Props['onLock'];
   onUnlock: Props['onUnlock'];
@@ -249,32 +258,38 @@ function RepoSection({ repo, multiRepo, onDelete, onLock, onUnlock, onPrune, onO
           <Codicon name={collapsed ? 'chevron-right' : 'chevron-down'} style={{ fontSize: '11px', flexShrink: 0 }} />
           <span style={css.dot(projectColor)} />
           <span style={css.repoName}>{repo.repoName}</span>
+          {busy && <span role="status" aria-live="polite" title={t('Worktree operation in progress…')}><Codicon name="loading~spin" /></span>}
           <div style={{ marginLeft: 'auto', display: 'flex', gap: '2px' }}>
             {hasPrunable && (
               <button
                 data-action-btn=""
                 style={css.headerBtn}
                 title={t('Prune stale worktrees')}
+                disabled={busy}
                 onClick={e => { e.stopPropagation(); onPrune(repo.repoId); }}
               >
                 <Codicon name="git-compare" style={{ fontSize: '12px' }} />
               </button>
             )}
-            {!repo.isLinkedWorktree && (
-              <button
-                data-action-btn=""
-                style={css.headerBtn}
-                title={t('Add worktree')}
-                onClick={e => { e.stopPropagation(); onRequestCreate(repo.repoId); }}
-              >
-                <Codicon name="add" style={{ fontSize: '12px' }} />
-              </button>
-            )}
+            <button
+              data-action-btn=""
+              style={css.headerBtn}
+              title={t('Add worktree')}
+              disabled={busy}
+              onClick={e => { e.stopPropagation(); onRequestCreate(repo.repoId); }}
+            >
+              <Codicon name="add" style={{ fontSize: '12px' }} />
+            </button>
           </div>
         </div>
       )}
       {!collapsed && (
-        repo.worktrees.length === 0 ? (
+        repo.error ? (
+          <div style={css.errorRow}>
+            <span>{repo.error}</span>
+            <button data-secondary-action-btn="" style={css.actionBtn} onClick={onRefresh}>{t('Retry')}</button>
+          </div>
+        ) : repo.worktrees.length === 0 ? (
           <div style={css.empty}>{t('No worktrees')}</div>
         ) : (
           repo.worktrees.map(w => (
@@ -283,6 +298,7 @@ function RepoSection({ repo, multiRepo, onDelete, onLock, onUnlock, onPrune, onO
               entry={w}
               pathTag={pathTags.get(w.path) ?? w.path}
               repoId={repo.repoId}
+              busy={busy}
               onDelete={onDelete}
               onLock={onLock}
               onUnlock={onUnlock}
@@ -294,20 +310,18 @@ function RepoSection({ repo, multiRepo, onDelete, onLock, onUnlock, onPrune, onO
           ))
         )
       )}
-      {!multiRepo && (hasPrunable || !repo.isLinkedWorktree) && (
+      {!multiRepo && (
         <div style={css.singleRepoActions}>
           {hasPrunable && (
-            <button data-secondary-action-btn="" style={css.actionBtn} onClick={() => onPrune(repo.repoId)}>
+            <button data-secondary-action-btn="" style={css.actionBtn} disabled={busy} onClick={() => onPrune(repo.repoId)}>
               <Codicon name="git-compare" style={{ marginRight: '4px', fontSize: '12px' }} />
               {t('Prune stale')}
             </button>
           )}
-          {!repo.isLinkedWorktree && (
-            <button data-secondary-action-btn="" style={css.actionBtn} onClick={() => onRequestCreate(repo.repoId)}>
-              <Codicon name="add" style={{ marginRight: '4px', fontSize: '12px' }} />
-              {t('New Worktree')}
-            </button>
-          )}
+          <button data-secondary-action-btn="" style={css.actionBtn} disabled={busy} onClick={() => onRequestCreate(repo.repoId)}>
+            <Codicon name="add" style={{ marginRight: '4px', fontSize: '12px' }} />
+            {t('New Worktree')}
+          </button>
         </div>
       )}
     </div>
@@ -317,7 +331,7 @@ function RepoSection({ repo, multiRepo, onDelete, onLock, onUnlock, onPrune, onO
 // ── Public component ──────────────────────────────────────────────────────────
 
 export function WorktreePanel({
-  repos, loading, error, multiRepo,
+  repos, loading, error, multiRepo, busyRepoIds, onRefresh,
   onDelete, onLock, onUnlock, onPrune,
   onOpenInExplorer, onOpenInNewWindow, onOpenInOS, onAddToWorkspace, onRequestCreate,
 }: Props) {
@@ -329,7 +343,7 @@ export function WorktreePanel({
     </div>
   );
 
-  const allEmpty = repos.every(r => r.worktrees.length === 0);
+  const allEmpty = repos.length === 0;
 
   return (
     <div style={css.root}>
@@ -342,6 +356,8 @@ export function WorktreePanel({
             isFirst={idx === 0}
             repo={repo}
             multiRepo={multiRepo}
+            busy={busyRepoIds.has(repo.repoId)}
+            onRefresh={onRefresh}
             onDelete={onDelete}
             onLock={onLock}
             onUnlock={onUnlock}

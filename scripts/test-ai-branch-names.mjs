@@ -53,7 +53,7 @@ const vscode = {
   },
 };
 const bundle = await build({
-  stdin: { contents: "export { AiBranchNameService } from './src/host/aiBranchName/AiBranchNameService'; export {promptBranchName} from './src/host/ui/promptBranchName'; export {GitService} from './src/host/git/GitService'; export {BranchStatusBar} from './src/host/ui/BranchStatusBar'; export {CommitPanelProvider} from './src/host/panels/CommitPanelProvider'; export {GitLogPanelProvider} from './src/host/panels/GitLogPanelProvider';", resolveDir: root },
+  stdin: { contents: "export { AiBranchNameService } from './src/host/aiBranchName/AiBranchNameService'; export {promptBranchName} from './src/host/ui/promptBranchName'; export {GitService} from './src/host/git/GitService'; export {GitWorktreeWorkflow} from './src/host/git/GitWorktreeWorkflow'; export {BranchStatusBar} from './src/host/ui/BranchStatusBar'; export {CommitPanelProvider} from './src/host/panels/CommitPanelProvider'; export {GitLogPanelProvider} from './src/host/panels/GitLogPanelProvider';", resolveDir: root },
   bundle: true, write: false, platform: 'node', format: 'cjs', external: ['vscode', 'simple-git'],
 });
 const module = { exports: {} };
@@ -61,7 +61,7 @@ vm.runInNewContext(bundle.outputFiles[0].text, {
   module, exports: module.exports, require: id => id === 'vscode' ? vscode : require(id),
   process, Buffer, console, setTimeout, clearTimeout, URL, TextDecoder, TextEncoder,
 });
-const { AiBranchNameService, promptBranchName, GitService, BranchStatusBar, CommitPanelProvider, GitLogPanelProvider } = module.exports;
+const { AiBranchNameService, promptBranchName, GitService, GitWorktreeWorkflow, BranchStatusBar, CommitPanelProvider, GitLogPanelProvider } = module.exports;
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 function repo(name) {
   const cwd = path.join(temp, name); fs.mkdirSync(cwd);
@@ -247,12 +247,17 @@ try {
     }
     manager.getRepoMeta = id => ({ name: id });
     const log = Object.create(GitLogPanelProvider.prototype); Object.assign(log, { manager, aiBranchNameService: service, post() {} });
-    const commit = Object.create(CommitPanelProvider.prototype); Object.assign(commit, { manager, aiBranchNameService: service, post() {} });
+    const commit = Object.create(CommitPanelProvider.prototype);
+    Object.assign(commit, { manager, aiBranchNameService: service, worktreeWorkflow: new GitWorktreeWorkflow(service), post() {} });
+    // Worktree creation now resolves its starting point before asking for the AI-capable name.
+    const originalInput = vscode.window.showInputBox;
+    vscode.window.showInputBox = async options => options.title === 'New Worktree — Starting Point' ? 'HEAD' : originalInput(options);
     for (const [provider, message] of [[log, { type: 'LOG_NEW_BRANCH_FROM_COMMIT', repoId: 'a', hash: 'HEAD', requestId: 'test' }], [commit, { type: 'SYNC_CREATE_BRANCH_FROM_COMMIT', repoId: 'a', hash: 'HEAD' }], [commit, { type: 'WORKTREE_CREATE_PROMPT', repoId: 'a' }]]) {
       vscode.window.showQuickPick = async items => items[0];
       const count = inputs.length; const action = provider.handleMessage(message);
       await until(() => inputs.length > count); assert.equal(inputs.at(-1).buttons[0].iconPath.id, 'sparkle'); inputs.at(-1).hide(); await action;
     }
+    vscode.window.showInputBox = originalInput;
   });
   await test('detached HEAD prompts before and after commit both use AI-capable inputs', async () => {
     git(a.rootPath, 'checkout', '--detach', 'HEAD');

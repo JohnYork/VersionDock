@@ -205,7 +205,7 @@ export type HostToCommitMsg =
   | { type: 'SUBMODULE_DIFF_SUMMARY_RESULT'; requestId: string; parentRepoId: string; submodulePath: string; oldHash?: string; newHash?: string; parentCommit?: string; indexCommit?: string; headCommit?: string; summary?: string; error?: string }
   | { type: 'SUBMODULE_PUSH_RESULT'; requestId: string; repoId: string; ok: boolean; error?: string }
   | { type: 'SUBMODULE_PULL_RESULT'; requestId: string; repoId: string; ok: boolean; output?: string; error?: string }
-  | { type: 'WORKTREE_LIST_RESULT'; repos: Array<{ repoId: string; repoName: string; repoColor: string; worktrees: WorktreeEntry[]; isLinkedWorktree: boolean }> }
+  | { type: 'WORKTREE_LIST_RESULT'; requestId?: string; repos: Array<{ repoId: string; repoName: string; repoColor: string; worktrees: WorktreeEntry[]; isLinkedWorktree: boolean; error?: string }> }
   | { type: 'WORKTREE_OP_RESULT'; requestId: string; repoId: string; op: 'create' | 'delete' | 'prune' | 'lock' | 'unlock'; ok: boolean; error?: string }
   | { type: 'SUBTREE_LIST_RESULT'; entries: SubtreeEntry[]; error?: string }
   | { type: 'SUBTREE_STATUS_RESULT'; statuses: Record<string, SubtreePushStatus> }
@@ -346,8 +346,8 @@ export type CommitToHostMsg =
   | { type: 'NOTIFY_INFO'; message: string; repoId?: string }
   | { type: 'COMMIT_REVEAL_IN_EXPLORER'; repoId: string; filePath: string }
   | { type: 'COMMIT_REVEAL_IN_OS'; repoId: string; filePath: string }
-  | { type: 'WORKTREE_REQUEST_LIST' }
-  | { type: 'WORKTREE_CREATE_PROMPT'; repoId: string }
+  | { type: 'WORKTREE_REQUEST_LIST'; requestId?: string }
+  | { type: 'WORKTREE_CREATE_PROMPT'; repoId: string; requestId?: string }
   | { type: 'WORKTREE_CREATE'; requestId: string; repoId: string; worktreePath: string; branch?: string; newBranch?: string; commitish?: string; noTrack?: boolean }
   | { type: 'WORKTREE_DELETE'; requestId: string; repoId: string; worktreePath: string; force?: boolean }
   | { type: 'WORKTREE_PRUNE'; requestId: string; repoId: string }

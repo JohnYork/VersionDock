@@ -390,9 +390,12 @@ export function CommitApp() {
   const [stashFilesMap, setStashFilesMap] = useState<Record<string, Record<string, { loading: boolean; files?: StashEntry['files']; error?: string }>>>({});
 
   // ── Worktree state ────────────────────────────────────────────────────────
-  const [worktreeRepos, setWorktreeRepos] = useState<Array<{ repoId: string; repoName: string; repoColor: string; worktrees: WorktreeEntry[]; isLinkedWorktree: boolean }>>([]);
+  const [worktreeRepos, setWorktreeRepos] = useState<Array<{ repoId: string; repoName: string; repoColor: string; worktrees: WorktreeEntry[]; isLinkedWorktree: boolean; error?: string }>>([]);
   const [worktreeLoading, setWorktreeLoading] = useState(false);
   const [worktreeError, setWorktreeError] = useState<string | null>(null);
+  const worktreeListRequestId = useRef<string>();
+  const pendingWorktreeRequests = useRef(new Map<string, string>());
+  const [busyWorktreeRepos, setBusyWorktreeRepos] = useState<Set<string>>(new Set());
 
   // ── Subtree state ────────────────────────────────────────────────────────
   const [subtreeEntries, setSubtreeEntries] = useState<SubtreeEntry[]>([]);
@@ -676,7 +679,9 @@ export function CommitApp() {
       setWorktreeLoading(true);
     }
     setWorktreeError(null);
-    send({ type: 'WORKTREE_REQUEST_LIST' });
+    const requestId = generateId();
+    worktreeListRequestId.current = requestId;
+    send({ type: 'WORKTREE_REQUEST_LIST', requestId });
   }, [send]);
 
   const requestSubmoduleList = useCallback((silent = false) => {
@@ -1460,12 +1465,16 @@ export function CommitApp() {
           break;
 
         case 'WORKTREE_LIST_RESULT':
+          if (msg.requestId && msg.requestId !== worktreeListRequestId.current) break;
+          worktreeListRequestId.current = undefined;
           setWorktreeLoading(false);
           setWorktreeRepos(msg.repos);
           dirtyTabsRef.current.delete('worktree');
           break;
 
         case 'WORKTREE_OP_RESULT':
+          pendingWorktreeRequests.current.delete(msg.requestId);
+          setBusyWorktreeRepos(new Set(pendingWorktreeRequests.current.values()));
           if (!msg.ok) {
             if (msg.error && msg.error !== 'Cancelled') notifyError(msg.error, msg.repoId);
           } else {
@@ -1604,21 +1613,29 @@ export function CommitApp() {
 
   // ── Worktree callbacks ────────────────────────────────────────────────────
 
-  const handleWorktreeDelete = useCallback((repoId: string, worktreePath: string, force: boolean) => {
-    send({ type: 'WORKTREE_DELETE', requestId: generateId(), repoId, worktreePath, force });
+  const sendWorktreeOperation = useCallback((message: Extract<CommitToHostMsg, { type: 'WORKTREE_DELETE' | 'WORKTREE_LOCK' | 'WORKTREE_UNLOCK' | 'WORKTREE_PRUNE' | 'WORKTREE_CREATE_PROMPT' }>) => {
+    if (Array.from(pendingWorktreeRequests.current.values()).includes(message.repoId)) return;
+    const requestId = generateId();
+    pendingWorktreeRequests.current.set(requestId, message.repoId);
+    setBusyWorktreeRepos(new Set(pendingWorktreeRequests.current.values()));
+    send({ ...message, requestId });
   }, [send]);
+
+  const handleWorktreeDelete = useCallback((repoId: string, worktreePath: string, force: boolean) => {
+    sendWorktreeOperation({ type: 'WORKTREE_DELETE', requestId: '', repoId, worktreePath, force });
+  }, [sendWorktreeOperation]);
 
   const handleWorktreeLock = useCallback((repoId: string, worktreePath: string) => {
-    send({ type: 'WORKTREE_LOCK', requestId: generateId(), repoId, worktreePath });
-  }, [send]);
+    sendWorktreeOperation({ type: 'WORKTREE_LOCK', requestId: '', repoId, worktreePath });
+  }, [sendWorktreeOperation]);
 
   const handleWorktreeUnlock = useCallback((repoId: string, worktreePath: string) => {
-    send({ type: 'WORKTREE_UNLOCK', requestId: generateId(), repoId, worktreePath });
-  }, [send]);
+    sendWorktreeOperation({ type: 'WORKTREE_UNLOCK', requestId: '', repoId, worktreePath });
+  }, [sendWorktreeOperation]);
 
   const handleWorktreePrune = useCallback((repoId: string) => {
-    send({ type: 'WORKTREE_PRUNE', requestId: generateId(), repoId });
-  }, [send]);
+    sendWorktreeOperation({ type: 'WORKTREE_PRUNE', requestId: '', repoId });
+  }, [sendWorktreeOperation]);
 
   const handleWorktreeOpenInExplorer = useCallback((repoId: string, worktreePath: string) => {
     send({ type: 'WORKTREE_OPEN_IN_EXPLORER', repoId, worktreePath });
@@ -1637,8 +1654,8 @@ export function CommitApp() {
   }, [send]);
 
   const handleWorktreeRequestCreate = useCallback((repoId: string) => {
-    send({ type: 'WORKTREE_CREATE_PROMPT', repoId } as CommitToHostMsg);
-  }, [send]);
+    sendWorktreeOperation({ type: 'WORKTREE_CREATE_PROMPT', repoId });
+  }, [sendWorktreeOperation]);
 
   // ── Stash files callback ──────────────────────────────────────────────────
   const requestStashFiles = useCallback((repoId: string, stashRef: string, stashOid?: string) => {
@@ -3414,6 +3431,8 @@ export function CommitApp() {
                 repos={visibleWorktreeRepos}
                 loading={worktreeLoading}
                 error={worktreeError}
+                busyRepoIds={busyWorktreeRepos}
+                onRefresh={() => requestWorktreeList()}
                 multiRepo={multiRepo}
                 onDelete={handleWorktreeDelete}
                 onLock={handleWorktreeLock}
