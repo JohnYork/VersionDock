@@ -52,6 +52,16 @@ test('first release always has a notes file, including test, style, CI, build an
   assert.ok(!notes.includes('Full diff'));
 });
 
+test('release validation rejects icons above the Marketplace size limit before publishing', t => {
+  const { root } = fixture(t);
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '1.0.0', icon: 'icon.png' }));
+  writeFileSync(join(root, 'icon.png'), Buffer.alloc(1024 * 1024));
+  assert.equal(packageVersion(root), '1.0.0');
+  writeFileSync(join(root, 'icon.png'), Buffer.alloc(1024 * 1024 + 1));
+  assert.throws(() => packageVersion(root), /icon exceeds the Marketplace limit/);
+  assert.throws(() => resolveRelease(root, { event: 'workflow_dispatch' }), /icon exceeds the Marketplace limit/);
+});
+
 test('release notes use a reachable prior tag and ignore a higher tag on another branch', t => {
   const { root, git, commit } = fixture(t);
   git('tag', 'v0.8.0'); commit('fix(api): reachable change'); git('tag', '-a', 'v0.9.0', '-m', 'previous');

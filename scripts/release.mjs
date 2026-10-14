@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +13,9 @@ export function packageVersion(root) {
   if (!stableVersion.test(pkg.version)) throw new Error('Release version must be a stable X.Y.Z version.');
   if (lock.version !== pkg.version || lock.packages?.['']?.version !== pkg.version) {
     throw new Error('package.json and both root package-lock.json versions must match.');
+  }
+  if (pkg.icon && statSync(resolve(root, pkg.icon)).size > 1024 * 1024) {
+    throw new Error('Extension icon exceeds the Marketplace limit of 1024 KB. Optimize it before releasing.');
   }
   return pkg.version;
 }

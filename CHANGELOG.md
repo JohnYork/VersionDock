@@ -1,5 +1,19 @@
 # 更改日志 / Changelog
 
+## 1.0.4
+
+### 修复
+
+- 无损优化扩展图标，使其满足 VS Code Marketplace 的 1024 KB 文件大小限制；图标尺寸和像素保持不变。
+- 发布前校验图标体积，避免检查与打包完成后才因图标过大被市场拒绝。
+- 包含 1.0.3 的功能与修复；1.0.3 已发布到 GitHub，其 Marketplace 上传因图标大小限制失败。
+
+### Fixes
+
+- Losslessly optimize the extension icon to meet the VS Code Marketplace limit of 1024 KB, preserving its dimensions and pixels.
+- Validate icon size before publishing, preventing oversized icons from being rejected after checks and packaging have completed.
+- Include the features and fixes from 1.0.3. Version 1.0.3 was released on GitHub, but its Marketplace upload failed because of the icon size limit.
+
 ## 1.0.3
 
 ### 新增与改进
