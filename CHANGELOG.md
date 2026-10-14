@@ -1,5 +1,29 @@
 # 更改日志 / Changelog
 
+## 1.0.3
+
+### 新增与改进
+
+- Git 分支创建输入框支持 AI 命名：可根据任务描述或当前改动生成名称，编辑确认后再创建，并校验名称合法性与冲突。
+- 工作树创建支持选择新分支的起点；选择远程分支时创建或复用本地分支，已占用分支可直接打开现有工作树。创建完成后可打开新窗口或加入工作区。
+- 工作树列表增加父目录路径标签，帮助区分同名目录；操作期间禁用重复点击，列表读取失败时显示错误与重试入口。单独打开工作树时保留新建入口。
+- 工作树移除增加确认和本地文件检查，保护未保存编辑器、搁置记录与游离状态下的独有提交；清理失效登记时同样保护搁置记录。
+
+### 修复
+
+- 修复提交、合并、推送、抓取和切换分支后，分支列表及上游同步数量未及时刷新的问题，避免较早的异步查询覆盖新状态。
+
+### Features and improvements
+
+- Add AI naming to Git branch creation inputs. Generate names from a task description or current changes, review and edit them before creation, and validate names and conflicts.
+- Allow choosing a starting point for a new worktree branch. Create or reuse local branches when selecting remote branches, open existing worktrees for occupied branches, and offer opening a new window or adding the created worktree to the workspace.
+- Add parent-directory labels to distinguish worktrees with the same directory name. Disable repeated operations while busy, show list errors with a retry action, and retain worktree creation when a linked worktree is opened on its own.
+- Add removal confirmation and local-file checks to protect unsaved editors, shelves and detached commits without a branch or tag. Preserve shelves when pruning stale worktree registrations as well.
+
+### Fixes
+
+- Refresh branch lists and upstream synchronization counts after commits, merges, pushes, fetches and branch switches, and prevent older asynchronous queries from overwriting newer state.
+
 ## 1.0.2
 
 ### 发布支持
