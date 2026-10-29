@@ -47,6 +47,7 @@ import type { AiBranchNameService } from '../aiBranchName/AiBranchNameService';
 import { promptBranchName } from '../ui/promptBranchName';
 import { GitWorktreeWorkflow } from '../git/GitWorktreeWorkflow';
 import { buildPullRequestUrl } from '../utils/prUrlHelper';
+import { groupSvnWorkingCopiesByUuid } from '../vcs/svnCommitGrouping';
 
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 const AI_COMMIT_CONTEXT_LINES_AROUND_CHANGE = 3;
@@ -76,6 +77,12 @@ type SvnIgnorePickItem = vscode.QuickPickItem & { entry: SvnIgnoreEntry };
 type SvnIgnoreActionPickItem = vscode.QuickPickItem & { action: 'add' | 'remove' };
 type SvnIgnoreCandidatePickItem = vscode.QuickPickItem & { filePath?: string; custom?: boolean };
 type NormalizedCommitGenerateMessageTarget = CommitGenerateMessageTarget & { source: 'selected' | 'staged' | 'working' };
+type SvnMultiWorkingCopyCommit = {
+  getRepositoryUuid?: () => Promise<string | undefined>;
+  prepareCommitTargets?: (paths: string[]) => Promise<string[]>;
+  commitAbsoluteTargets?: (message: string, absoluteTargets: string[]) => Promise<string>;
+  invalidateAfterExternalCommit?: () => void;
+};
 
 function throwIfCancellationRequested(token: vscode.CancellationToken): void {
   if (token.isCancellationRequested) throw new Error('Cancelled');
@@ -1009,6 +1016,25 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
   /** Reads fresh status after a stage/unstage/commit op. Uses refreshStatusNow with suppression bypass to immediately publish fresh state. */
   private async refreshStatusAfterOp(): Promise<WorkspaceStatus> {
     return this.manager.refreshStatusNow(undefined, { bypassSuppression: true });
+  }
+
+  /**
+   * Working copies of one SVN repository are discovered as separate repositories.
+   * Resolve their shared repository UUID so a multi-repository commit can merge
+   * them into a single revision instead of committing each working copy alone.
+   */
+  private async resolveSvnCommitGroups(repoIds: string[]): Promise<Map<string, string[]>> {
+    const candidates: Array<{ repoId: string; repositoryUuid?: string }> = [];
+    for (const repoId of repoIds) {
+      const repo = this.manager.getRepo(repoId) as unknown as SvnMultiWorkingCopyCommit | undefined;
+      if (!repo?.getRepositoryUuid) continue;
+      try {
+        candidates.push({ repoId, repositoryUuid: await repo.getRepositoryUuid() });
+      } catch {
+        // Unreadable repository metadata keeps this working copy on its own commit.
+      }
+    }
+    return groupSvnWorkingCopiesByUuid(candidates);
   }
 
   private async pickSvnIgnorePath(
@@ -3272,6 +3298,17 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
               return bDepth - aDepth; // deeper (submodules) first
             });
 
+            const svnRepoIds = ordered
+              .filter(entry => entry.filesToStage.some(p => p.length > 0)
+                && this.manager.getRepo(entry.repoId)?.kind === 'svn')
+              .map(entry => entry.repoId);
+            // Separate working copies of one SVN repository share a repository UUID;
+            // committing them together produces a single revision.
+            const svnCommitGroups = svnRepoIds.length > 1
+              ? await this.resolveSvnCommitGroups(svnRepoIds)
+              : new Map<string, string[]>();
+            const handledSvnRepoIds = new Set<string>();
+
             const total = ordered.length;
             const stepIncrement = total > 0 ? 100 / total : undefined;
             const committedRepoIds = new Set<string>();
@@ -3284,6 +3321,8 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
 
             for (let i = 0; i < ordered.length; i++) {
               const r = ordered[i];
+              // A merged SVN group already committed or failed for this working copy.
+              if (handledSvnRepoIds.has(r.repoId)) continue;
               const repo = this.manager.getRepo(r.repoId);
               const repoMeta = repoMetas.find(m => m.id === r.repoId);
               const repoName = (repoMeta?.name ?? path.basename(repo?.rootPath ?? '')) || r.repoId;
@@ -3316,6 +3355,40 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
               try {
                 if (repo.kind === 'svn') {
                   const selectedPaths = Array.from(new Set(r.filesToStage.filter(p => p.length > 0)));
+                  const svnCommitGroup = svnCommitGroups.get(r.repoId);
+                  if (svnCommitGroup) {
+                    for (const groupRepoId of svnCommitGroup) handledSvnRepoIds.add(groupRepoId);
+                    try {
+                      const absoluteTargets: string[] = [];
+                      let primaryRepo: SvnMultiWorkingCopyCommit | undefined;
+                      for (const groupRepoId of svnCommitGroup) {
+                        const groupEntry = ordered.find(entry => entry.repoId === groupRepoId);
+                        const groupRepo = this.manager.getRepo(groupRepoId) as unknown as SvnMultiWorkingCopyCommit | undefined;
+                        if (!groupRepo?.prepareCommitTargets) throw new Error(t('SVN selective commit is unavailable.'));
+                        if (!primaryRepo) primaryRepo = groupRepo;
+                        const groupPaths = Array.from(new Set((groupEntry?.filesToStage ?? []).filter(p => p.length > 0)));
+                        absoluteTargets.push(...await groupRepo.prepareCommitTargets(groupPaths));
+                      }
+                      if (!primaryRepo?.commitAbsoluteTargets) throw new Error(t('SVN selective commit is unavailable.'));
+                      await primaryRepo.commitAbsoluteTargets(r.message, absoluteTargets);
+                      for (const groupRepoId of svnCommitGroup) {
+                        committedRepoIds.add(groupRepoId);
+                        if (groupRepoId === r.repoId) continue;
+                        (this.manager.getRepo(groupRepoId) as unknown as SvnMultiWorkingCopyCommit | undefined)
+                          ?.invalidateAfterExternalCommit?.();
+                      }
+                      this.logger?.info('Commit', 'SVN working copies committed as one revision', {
+                        repositoryIds: svnCommitGroup,
+                        fileCount: absoluteTargets.length,
+                        requestId: msg.requestId,
+                      });
+                    } catch (groupErr: unknown) {
+                      if (!isRemoteRepositoryCancelled(groupErr)) {
+                        commitErrors.push(`${repoName}: ${String(groupErr)}`);
+                      }
+                    }
+                    continue;
+                  }
                   const svnRepo = repo as typeof repo & { commitPaths?: (message: string, paths: string[]) => Promise<string> };
                   if (svnRepo.commitPaths) {
                     await svnRepo.commitPaths(r.message, selectedPaths);
