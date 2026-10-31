@@ -48,6 +48,8 @@ import { promptBranchName } from '../ui/promptBranchName';
 import { GitWorktreeWorkflow } from '../git/GitWorktreeWorkflow';
 import { buildPullRequestUrl } from '../utils/prUrlHelper';
 import { groupSvnWorkingCopiesByUuid } from '../vcs/svnCommitGrouping';
+import { groupGitWorktreesByInstance, type GitWorktreeGroupCandidate } from '../vcs/gitWorktreeGrouping';
+import { commitWorktreeGroupAsOne, type GitWorktreeGroupCommitRepo } from '../vcs/gitWorktreeCommit';
 
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 const AI_COMMIT_CONTEXT_LINES_AROUND_CHANGE = 3;
@@ -1035,6 +1037,75 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
       }
     }
     return groupSvnWorkingCopiesByUuid(candidates);
+  }
+
+  /**
+   * Linked worktrees of one Git repository instance are discovered as separate
+   * repositories. Resolve their shared common dir so a multi-repository commit
+   * can merge members that sit on the same commit into a single commit on the
+   * primary member's branch. Members on diverged commits, detached HEADs, or in
+   * the middle of an operation keep their individual commits.
+   */
+  private async resolveGitWorktreeGroups(repoIds: string[]): Promise<Map<string, string[]>> {
+    const candidates: GitWorktreeGroupCandidate[] = [];
+    for (const repoId of repoIds) {
+      const repo = this.manager.getRepo(repoId);
+      if (!repo || repo.kind !== 'git') continue;
+      const gitRepo = repo as unknown as {
+        getGitCommonDir(): Promise<string>;
+        getHeadCommitId(): Promise<string | undefined>;
+        getCurrentBranch(): Promise<{ name?: string; isDetached?: boolean }>;
+        getOperationState(): Promise<string | null>;
+      };
+      try {
+        const [gitCommonDir, headCommitId, branchInfo, operationState] = await Promise.all([
+          gitRepo.getGitCommonDir(),
+          gitRepo.getHeadCommitId(),
+          gitRepo.getCurrentBranch().catch(() => undefined),
+          gitRepo.getOperationState().catch(() => null),
+        ]);
+        candidates.push({
+          repoId,
+          gitCommonDir,
+          headCommitId,
+          branchName: branchInfo && !branchInfo.isDetached ? branchInfo.name : undefined,
+          operationState,
+        });
+      } catch {
+        // Unreadable instance metadata keeps this worktree on its own commit.
+      }
+    }
+    const groups = groupGitWorktreesByInstance(candidates);
+    // Tell the user why some worktrees of one instance were not merged: two
+    // members pointing at different commits cannot share a single revision.
+    const byCommonDir = new Map<string, GitWorktreeGroupCandidate[]>();
+    for (const candidate of candidates) {
+      const key = path.resolve(candidate.gitCommonDir);
+      const bucket = byCommonDir.get(key);
+      if (bucket) bucket.push(candidate);
+      else byCommonDir.set(key, [candidate]);
+    }
+    const divergedNames: string[] = [];
+    for (const members of byCommonDir.values()) {
+      if (members.length < 2) continue;
+      const distinctHeads = new Set(members
+        .filter(member => member.headCommitId && member.branchName && !member.operationState)
+        .map(member => member.headCommitId));
+      if (distinctHeads.size > 1) {
+        divergedNames.push(...members.map(member => this.manager.getRepoMeta(member.repoId)?.name || member.repoId));
+      }
+    }
+    if (divergedNames.length > 0) {
+      vscode.window.showWarningMessage(t(
+        'VersionDock: worktrees of the same repository are on different commits ({0}), so they were committed separately.',
+        divergedNames.join(', '),
+      ));
+    }
+    // Every member maps to its group so the commit loop can process the whole
+    // group at whichever member it reaches first.
+    return new Map(groups.flatMap(group =>
+      group.members.map(member => [member.repoId, group.members.map(m => m.repoId)] as const),
+    ));
   }
 
   private async pickSvnIgnorePath(
@@ -3260,11 +3331,27 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
         // Multi-repository commit-and-push remains explicit: creating a
         // remote for several repositories would require a separate provider
         // choice for each repository and could leave a partial batch.
+        // Linked worktrees of one Git repository instance: resolve combined-commit
+        // groups before the push precheck, because only the primary member's
+        // branch gets pushed and secondary members must not be required to have
+        // a remote of their own.
+        const gitGroupEntries = msg.repos.filter(entry =>
+          entry.filesToStage.some(p => p.length > 0)
+          && this.manager.getRepo(entry.repoId)?.kind === 'git');
+        const gitWorktreeGroups = gitGroupEntries.length > 1
+          ? await this.resolveGitWorktreeGroups(gitGroupEntries.map(entry => entry.repoId))
+          : new Map<string, string[]>();
+        const gitGroupSecondaryIds = new Set<string>();
+        for (const groupMembers of gitWorktreeGroups.values()) {
+          for (const memberRepoId of groupMembers) {
+            if (memberRepoId !== groupMembers[0]) gitGroupSecondaryIds.add(memberRepoId);
+          }
+        }
         if (msg.andPush) {
           const noRemoteRepos: string[] = [];
           for (const r of msg.repos) {
             const repo = this.manager.getRepo(r.repoId);
-            if (!repo || repo.kind === 'svn') continue;
+            if (!repo || repo.kind === 'svn' || gitGroupSecondaryIds.has(r.repoId)) continue;
             const remotes = await repo.getRemotes().catch(() => [] as string[]);
             const repoName = (this.manager.getRepoMeta(r.repoId)?.name ?? path.basename(repo.rootPath)) || r.repoId;
             if (remotes.length === 0) noRemoteRepos.push(repoName);
@@ -3308,6 +3395,7 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
               ? await this.resolveSvnCommitGroups(svnRepoIds)
               : new Map<string, string[]>();
             const handledSvnRepoIds = new Set<string>();
+            const handledGitRepoIds = new Set<string>();
 
             const total = ordered.length;
             const stepIncrement = total > 0 ? 100 / total : undefined;
@@ -3323,6 +3411,8 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
               const r = ordered[i];
               // A merged SVN group already committed or failed for this working copy.
               if (handledSvnRepoIds.has(r.repoId)) continue;
+              // A combined Git worktree group already committed or failed for this worktree.
+              if (handledGitRepoIds.has(r.repoId)) continue;
               const repo = this.manager.getRepo(r.repoId);
               const repoMeta = repoMetas.find(m => m.id === r.repoId);
               const repoName = (repoMeta?.name ?? path.basename(repo?.rootPath ?? '')) || r.repoId;
@@ -3396,6 +3486,89 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
                     await repo.commit(r.message, false);
                   }
                   committedRepoIds.add(r.repoId);
+                  continue;
+                }
+                // Linked worktrees of one Git repository instance commit as one revision:
+                // a single commit on the primary member's branch, secondaries synced to it.
+                const gitWorktreeGroup = gitWorktreeGroups.get(r.repoId);
+                if (gitWorktreeGroup) {
+                  for (const groupRepoId of gitWorktreeGroup) handledGitRepoIds.add(groupRepoId);
+                  // The group always commits on the primary member's branch, which may
+                  // not be the member the loop reached first.
+                  const primaryRepoId = gitWorktreeGroup[0];
+                  let groupCommitted = false;
+                  try {
+                    const groupMembers = gitWorktreeGroup.map(groupRepoId => {
+                      const groupEntry = ordered.find(entry => entry.repoId === groupRepoId);
+                      const groupRepo = this.manager.getRepo(groupRepoId) as unknown as GitWorktreeGroupCommitRepo | undefined;
+                      if (!groupRepo) throw new Error(t('Repository not found: {0}', groupRepoId));
+                      return {
+                        repo: groupRepo,
+                        filesToStage: Array.from(new Set((groupEntry?.filesToStage ?? []).filter(p => p.length > 0))),
+                        filesToUnstage: groupEntry?.filesToUnstage ?? [],
+                      };
+                    });
+                    const creds = await this.getCommitCredentials(r.repoId);
+                    const groupResult = await commitWorktreeGroupAsOne({
+                      members: groupMembers,
+                      message: r.message,
+                      amend: r.amend,
+                      credentials: creds,
+                      noVerify: msg.noVerify,
+                      log: detail => this.logger?.debug('Commit', detail, { repoId: r.repoId, requestId: msg.requestId }),
+                    });
+                    for (const groupRepoId of gitWorktreeGroup) committedRepoIds.add(groupRepoId);
+                    if (groupResult.preservedChanges.length > 0) {
+                      const preservedList = groupResult.preservedChanges
+                        .map(change => `${change.repoId}: ${change.path}`)
+                        .join(', ');
+                      vscode.window.showWarningMessage(t(
+                        'VersionDock: combined worktree commit {0} created, but local changes were kept in: {1}',
+                        groupResult.commitId.slice(0, 7),
+                        preservedList,
+                      ));
+                    }
+                    this.logger?.info('Commit', 'Git worktrees committed as one commit', {
+                      repositoryIds: gitWorktreeGroup,
+                      commitId: groupResult.commitId,
+                      preservedChangeCount: groupResult.preservedChanges.length,
+                      requestId: msg.requestId,
+                    });
+                    groupCommitted = true;
+                  } catch (groupErr: unknown) {
+                    if (!isRemoteRepositoryCancelled(groupErr)) {
+                      commitErrors.push(`${repoName}: ${String(groupErr)}`);
+                    }
+                  }
+                  // Only the primary member's branch carries the combined commit;
+                  // every worktree shares the same refs, so the others need no push.
+                  const primaryRepo = groupCommitted ? this.manager.getRepo(primaryRepoId) : undefined;
+                  if (msg.andPush && primaryRepo) {
+                    const primaryMeta = repoMetas.find(m => m.id === primaryRepoId);
+                    const primaryName = (primaryMeta?.name ?? path.basename(primaryRepo.rootPath)) || primaryRepoId;
+                    try {
+                      const pushResult = await runPushWithProtection(primaryRepo, {
+                        repoName: primaryName,
+                        logger: this.logger,
+                        silentOnSuccess: msg.repos.length > 1,
+                        suppressProgress: msg.repos.length > 1,
+                        beforePush: () => this.checkUnpushedSubmodules(primaryRepoId),
+                      });
+                      if (pushResult.success) {
+                        pushedRepoIds.add(primaryRepoId);
+                      } else if (pushResult.cancelled) {
+                        pushCancelledRepoIds.add(primaryRepoId);
+                      } else {
+                        pushErrors.push(`${primaryName}: ${pushResult.error ? String(pushResult.error) : t('Push failed')}`);
+                      }
+                    } catch (pushErr: unknown) {
+                      if (isRemoteRepositoryCancelled(pushErr)) {
+                        pushCancelledRepoIds.add(primaryRepoId);
+                      } else {
+                        pushErrors.push(`${primaryName}: ${String(pushErr)}`);
+                      }
+                    }
+                  }
                   continue;
                 }
                 // Stage/unstage according to user selection before committing
@@ -3504,7 +3677,10 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
                 this.logProvider?.refresh({ repoIds: msg.repos.map(r => r.repoId) });
               }
             } else {
-              const allPushTargetCount = ordered.filter(r => this.manager.getRepo(r.repoId)?.kind !== 'svn').length;
+              // Secondary worktree members are synced by the combined commit and are not pushed.
+              const allPushTargetCount = ordered
+                .filter(r => this.manager.getRepo(r.repoId)?.kind !== 'svn' && !gitGroupSecondaryIds.has(r.repoId))
+                .length;
               const isAllPushed = committedRepoIds.size === total && pushedRepoIds.size === allPushTargetCount;
 
               if (isAllPushed) {
