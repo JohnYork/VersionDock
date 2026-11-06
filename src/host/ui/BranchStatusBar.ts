@@ -5,6 +5,7 @@ import * as path from 'path';
 import { WorkspaceGitManager } from '../git/WorkspaceGitManager';
 import type { RepoMeta } from '../types/git';
 import type { SvnIgnoreEntry } from '../svn/SvnService';
+import { pickSvnIgnorePath } from '../svn/svnIgnorePicker';
 import { isPrimaryBranch } from '../utils/branchUtils';
 import { t } from '../utils/l10n';
 import { showGitErrorMessage } from '../utils/gitError';
@@ -27,14 +28,13 @@ import type { AiBranchNameService } from '../aiBranchName/AiBranchNameService';
 import { promptBranchName } from './promptBranchName';
 
 type SvnIgnoreRepo = {
-  addIgnoreEntry(entryPath: string): Promise<{ entry: string; directoryPath: string; alreadyExists: boolean }>;
+  addIgnoreEntry(entryPath: string): Promise<{ entry: string; directoryPath: string; alreadyExists: boolean } | undefined>;
   listIgnoreEntries(): Promise<SvnIgnoreEntry[]>;
   removeIgnoreEntries(entries: SvnIgnoreEntry[]): Promise<void>;
 };
 
 type SvnIgnorePickItem = vscode.QuickPickItem & { entry: SvnIgnoreEntry };
 type SvnIgnoreActionPickItem = vscode.QuickPickItem & { action: 'add' | 'remove' };
-type SvnIgnoreCandidatePickItem = vscode.QuickPickItem & { filePath?: string; custom?: boolean };
 
 function truncateBranchName(name: string, maxLength = 28): string {
   if (name.length <= maxLength) return name;
@@ -943,46 +943,6 @@ export class BranchStatusBar implements vscode.Disposable {
     await this.refresh();
   }
 
-  private async pickSvnIgnorePath(
-    repo: { getStatus(): Promise<{ unstagedFiles: Array<{ status: string; path: string }> }> },
-  ): Promise<string | undefined> {
-    const status = await repo.getStatus().catch(() => undefined);
-    const untrackedPaths = Array.from(new Set(
-      (status?.unstagedFiles ?? [])
-        .filter(file => file.status === 'untracked')
-        .map(file => file.path),
-    )).sort((left, right) => left.localeCompare(right));
-
-    const customItem: SvnIgnoreCandidatePickItem = {
-      label: `$(edit) ${t('Enter custom SVN ignore path...')}`,
-      custom: true,
-    };
-
-    if (untrackedPaths.length > 0) {
-      const picked = await vscode.window.showQuickPick<SvnIgnoreCandidatePickItem>(
-        [
-          ...untrackedPaths.map(filePath => ({ label: filePath, filePath })),
-          { label: '', kind: vscode.QuickPickItemKind.Separator },
-          customItem,
-        ],
-        {
-          title: t('Add SVN Ignore...'),
-          placeHolder: t('Select an unversioned file or folder to ignore'),
-          matchOnDescription: true,
-        },
-      );
-      if (!picked) return undefined;
-      if (!picked.custom) return picked.filePath;
-    }
-
-    return vscode.window.showInputBox({
-      title: t('Add SVN Ignore...'),
-      prompt: t('Enter a path relative to the repository root'),
-      placeHolder: 'path/to/file-or-folder',
-      validateInput: value => value.trim() ? undefined : t('SVN ignore target cannot be empty.'),
-    });
-  }
-
   private async manageSvnIgnore(meta: RepoMeta): Promise<void> {
     const repo = this.manager.getRepo(meta.id);
     if (!repo || repo.kind !== 'svn') return;
@@ -1008,9 +968,10 @@ export class BranchStatusBar implements vscode.Disposable {
       if (!action) return;
 
       if (action.action === 'add') {
-        const entryPath = await this.pickSvnIgnorePath(repo);
+        const entryPath = await pickSvnIgnorePath(repo);
         if (!entryPath) return;
         const result = await svn.addIgnoreEntry(entryPath);
+        if (!result) return;
         if (result.alreadyExists) {
           vscode.window.showInformationMessage(t('VersionDock [{0}]: "{1}" is already in SVN ignore for {2}', meta.name, result.entry, result.directoryPath || '.'));
         } else {

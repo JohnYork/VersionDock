@@ -595,6 +595,28 @@ export class GitService {
     return resolvePathWithinRepo(this.rootPath, filePath, options);
   }
 
+  /** 判断该路径（含子目录）是否存在被 Git 跟踪的文件。 */
+  async hasTrackedFiles(filePath: string): Promise<boolean> {
+    const normalized = resolvePathWithinRepo(this.rootPath, filePath, { allowAbsolute: true }).relativePath;
+    const raw = await this.rawPathSafe(['ls-files', '-z', '--', `:(literal)${normalized}`]).catch(() => '');
+    return raw.split('\0').some(entry => entry.length > 0);
+  }
+
+  /** 查找已覆盖该路径的忽略规则（包括更宽泛的通配模式）。 */
+  async findIgnoringRule(filePath: string): Promise<{ source: string; line: number; pattern: string } | undefined> {
+    const normalized = this.normalizeRepoPath(filePath);
+    let raw: string;
+    try {
+      raw = await this.rawPathSafe(['check-ignore', '-v', '--no-index', '--', normalized]);
+    } catch {
+      return undefined;
+    }
+    const meta = raw.split('\t')[0]?.trim() ?? '';
+    const match = meta.match(/^(.*):(\d+):(.*)$/);
+    if (!match) return undefined;
+    return { source: path.resolve(this.rootPath, match[1]), line: Number(match[2]), pattern: match[3] };
+  }
+
   protected normalizeRepoPath(filePath: string): string {
     return resolvePathWithinRepo(this.rootPath, filePath, { allowAbsolute: true }).relativePath;
   }

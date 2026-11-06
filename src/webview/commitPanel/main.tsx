@@ -3533,6 +3533,10 @@ export function CommitApp() {
         if (isSvn) {
           items = svnContextMenuItems(items, isUntracked);
         }
+        if (!isSvn && !isUntracked) {
+          // .gitignore 对已跟踪文件无效，隐藏该动作避免误导
+          items = compactContextMenuItems(items.filter(it => !('id' in it) || it.id !== 'gitignore'));
+        }
         if (file.isTruncated) {
           items = items
             .filter(it => !('id' in it) || it.id !== 'rollback')
@@ -3592,6 +3596,9 @@ export function CommitApp() {
         }
         if (isSvn) {
           items = svnContextMenuItems(items, allUntracked);
+        }
+        if (!isSvn && !allUntracked) {
+          items = compactContextMenuItems(items.filter(it => !('id' in it) || it.id !== 'gitignore'));
         }
         if (files.length > 0 && files.every(f => f.isTruncated)) {
           items = items.filter(it => !('id' in it) || it.id !== 'rollback');

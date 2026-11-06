@@ -1872,17 +1872,50 @@ export class SvnService extends GitService {
     };
   }
 
-  private async ensureSvnIgnoreParent(directoryPath: string, fullPath: string): Promise<void> {
+  private async assertSvnIgnoreParentIsDirectory(directoryPath: string): Promise<void> {
     const target = directoryPath || '.';
     const absolutePath = path.join(this.rootPath, target);
     if (fs.existsSync(absolutePath) && !fs.statSync(absolutePath).isDirectory()) {
       throw new Error(t('SVN ignore parent "{0}" is not a directory.', target));
     }
+  }
+
+  private async isVersionedSvnTarget(relativePath: string): Promise<boolean> {
     try {
-      await this.svn(['info', '--xml', '--', this.workingCopyTarget(target)]);
+      await this.svn(['info', '--xml', '--', this.workingCopyTarget(relativePath || '.')]);
+      return true;
     } catch {
-      throw new Error(t('SVN ignore can only be set on a versioned parent directory. Ignore "{0}" or add its parent directory first.', fullPath));
+      return false;
     }
+  }
+
+  /**
+   * `svn:ignore` 只能设置在已受版本控制的目录上，且只匹配该目录的直接子项。
+   * 父目录未受控时逐级向上查找最近的受控祖先，并在该祖先处忽略从它向下的
+   * 第一个未受控组件（忽略整棵子树，范围大于用户原始目标）。
+   * 工作副本根也不受控（`.svn` 元数据缺失或损坏）时返回 undefined。
+   */
+  private async resolveSvnIgnorePlacement(
+    target: { directoryPath: string; entry: string; fullPath: string },
+  ): Promise<{ directoryPath: string; entry: string; fullPath: string } | undefined> {
+    if (await this.isVersionedSvnTarget(target.directoryPath)) {
+      return target;
+    }
+    // 父目录就是工作副本根且不受控，不存在可供挂载 svn:ignore 的祖先。
+    if (target.directoryPath === '') return undefined;
+
+    const segments = target.directoryPath.split('/');
+    for (let index = segments.length - 2; index >= -1; index--) {
+      const anchorPath = segments.slice(0, index + 1).join('/');
+      if (!(await this.isVersionedSvnTarget(anchorPath))) continue;
+      const entry = segments[index + 1];
+      return {
+        directoryPath: anchorPath,
+        entry,
+        fullPath: anchorPath ? `${anchorPath}/${entry}` : entry,
+      };
+    }
+    return undefined;
   }
 
   private async getSvnIgnoreLines(directoryPath: string): Promise<string[]> {
@@ -1907,17 +1940,43 @@ export class SvnService extends GitService {
     }
   }
 
-  async addIgnoreEntry(entryPath: string): Promise<SvnIgnoreUpdateResult> {
+  async addIgnoreEntry(entryPath: string): Promise<SvnIgnoreUpdateResult | undefined> {
     const target = this.normalizeIgnoreTarget(entryPath);
-    await this.ensureSvnIgnoreParent(target.directoryPath, target.fullPath);
+    await this.assertSvnIgnoreParentIsDirectory(target.directoryPath);
 
-    const existing = await this.getSvnIgnoreLines(target.directoryPath);
-    if (existing.includes(target.entry)) {
-      return { ...target, alreadyExists: true };
+    const placement = await this.resolveSvnIgnorePlacement(target);
+    if (!placement) {
+      throw new Error(t(
+        'SVN ignore can only be set inside a versioned working copy. No versioned parent directory was found for "{0}"; check that the working copy metadata is intact.',
+        target.fullPath,
+      ));
     }
 
-    await this.setSvnIgnoreLines(target.directoryPath, [...existing, target.entry]);
-    return { ...target, alreadyExists: false };
+    // 父目录未受控时只能改为忽略最近的受控祖先下的第一个未受控组件，
+    // 忽略范围比用户原始目标更大，必须先明确确认。
+    if (placement.fullPath !== target.fullPath) {
+      const confirmLabel = t('Ignore "{0}"', placement.fullPath);
+      const confirmed = await vscode.window.showWarningMessage(
+        t(
+          'The parent directory "{0}" of "{1}" is not under version control, so SVN cannot ignore only that entry. Ignore "{2}" in "{3}" instead? The entire "{2}" subtree will be ignored.',
+          target.directoryPath || '.',
+          target.entry,
+          placement.fullPath,
+          placement.directoryPath || '.',
+        ),
+        { modal: true },
+        confirmLabel,
+      );
+      if (confirmed !== confirmLabel) return undefined;
+    }
+
+    const existing = await this.getSvnIgnoreLines(placement.directoryPath);
+    if (existing.includes(placement.entry)) {
+      return { ...placement, alreadyExists: true };
+    }
+
+    await this.setSvnIgnoreLines(placement.directoryPath, [...existing, placement.entry]);
+    return { ...placement, alreadyExists: false };
   }
 
   async listIgnoreEntries(): Promise<SvnIgnoreEntry[]> {

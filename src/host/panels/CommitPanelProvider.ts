@@ -20,8 +20,10 @@ import { openSquashEditor } from './SquashEditorPanel';
 import { openEditMessageEditor } from './EditMessageEditorPanel';
 import type { GitProfileService } from '../git/GitProfileService';
 import type { SvnIgnoreEntry, SvnIgnoreUpdateResult } from '../svn/SvnService';
+import { pickSvnIgnorePath } from '../svn/svnIgnorePicker';
 import { checkoutSvnRepository } from '../svn/svnCheckout';
 import { cloneGitRepository } from '../git/gitClone';
+import { buildGitignorePattern, gitignoreAppliesTo } from '../git/gitignorePattern';
 import { t } from '../utils/l10n';
 import { showGitErrorMessage } from '../utils/gitError';
 import { collectAbortOperationTargets, runAbortOperationFlow } from '../utils/abortOperation';
@@ -71,13 +73,12 @@ type SubtreeStatusRefreshOptions = {
   background?: boolean;
 };
 type SvnIgnoreRepo = {
-  addIgnoreEntry(entryPath: string): Promise<SvnIgnoreUpdateResult>;
+  addIgnoreEntry(entryPath: string): Promise<SvnIgnoreUpdateResult | undefined>;
   listIgnoreEntries(): Promise<SvnIgnoreEntry[]>;
   removeIgnoreEntries(entries: SvnIgnoreEntry[]): Promise<void>;
 };
 type SvnIgnorePickItem = vscode.QuickPickItem & { entry: SvnIgnoreEntry };
 type SvnIgnoreActionPickItem = vscode.QuickPickItem & { action: 'add' | 'remove' };
-type SvnIgnoreCandidatePickItem = vscode.QuickPickItem & { filePath?: string; custom?: boolean };
 type NormalizedCommitGenerateMessageTarget = CommitGenerateMessageTarget & { source: 'selected' | 'staged' | 'working' };
 type SvnMultiWorkingCopyCommit = {
   getRepositoryUuid?: () => Promise<string | undefined>;
@@ -1106,46 +1107,6 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
     return new Map(groups.flatMap(group =>
       group.members.map(member => [member.repoId, group.members.map(m => m.repoId)] as const),
     ));
-  }
-
-  private async pickSvnIgnorePath(
-    repo: { getStatus(): Promise<{ unstagedFiles: FileStatus[]; stagedFiles: FileStatus[] }> },
-  ): Promise<string | undefined> {
-    const status = await repo.getStatus().catch(() => undefined);
-    const untrackedPaths = Array.from(new Set(
-      (status?.unstagedFiles ?? [])
-        .filter(file => file.status === 'untracked')
-        .map(file => file.path),
-    )).sort((left, right) => left.localeCompare(right));
-
-    const customItem: SvnIgnoreCandidatePickItem = {
-      label: `$(edit) ${t('Enter custom SVN ignore path...')}`,
-      custom: true,
-    };
-
-    if (untrackedPaths.length > 0) {
-      const picked = await vscode.window.showQuickPick<SvnIgnoreCandidatePickItem>(
-        [
-          ...untrackedPaths.map(filePath => ({ label: filePath, filePath })),
-          { label: '', kind: vscode.QuickPickItemKind.Separator },
-          customItem,
-        ],
-        {
-          title: t('Add SVN Ignore...'),
-          placeHolder: t('Select an unversioned file or folder to ignore'),
-          matchOnDescription: true,
-        },
-      );
-      if (!picked) return undefined;
-      if (!picked.custom) return picked.filePath;
-    }
-
-    return vscode.window.showInputBox({
-      title: t('Add SVN Ignore...'),
-      prompt: t('Enter a path relative to the repository root'),
-      placeHolder: 'path/to/file-or-folder',
-      validateInput: value => value.trim() ? undefined : t('SVN ignore target cannot be empty.'),
-    });
   }
 
   private getChangesViewMode(): 'simplified' | 'changelists' | 'vscode' {
@@ -2768,6 +2729,95 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
       { title, matchOnDescription: true, matchOnDetail: true },
     );
     return picked ? entries.find(entry => entry.id === picked.entryId) : undefined;
+  }
+
+  private async addToGitignore(msg: Extract<CommitToHostMsg, { type: 'COMMIT_ADD_TO_GITIGNORE' }>): Promise<void> {
+    const repo = this.manager.getRepo(msg.repoId);
+    if (!repo || repo.kind !== 'git') return;
+    const ignoredPath = repo.resolveRepoPath(msg.entryPath);
+
+    // .gitignore 只对未跟踪路径生效；已跟踪文件需要先 git rm --cached
+    if (await repo.hasTrackedFiles(ignoredPath.relativePath)) {
+      vscode.window.showWarningMessage(
+        t('VersionDock [{0}]: "{1}" is tracked by Git, so adding it to .gitignore has no effect. Untrack it first (git rm --cached).', repo.meta.name, ignoredPath.relativePath)
+      );
+      return;
+    }
+
+    // 已被现有规则（含通配模式）覆盖时直接提示，避免追加冗余条目
+    const ignoringRule = await repo.findIgnoringRule(ignoredPath.relativePath);
+    if (ignoringRule) {
+      vscode.window.showInformationMessage(
+        t('VersionDock [{0}]: "{1}" is already ignored by "{2}" in {3}', repo.meta.name, ignoredPath.relativePath, ignoringRule.pattern, path.relative(repo.rootPath, ignoringRule.source))
+      );
+      return;
+    }
+
+    // Find all .gitignore files in the repo
+    const rootUri = vscode.Uri.file(repo.rootPath);
+    const allGitignoreFiles = await vscode.workspace.findFiles(
+      new vscode.RelativePattern(rootUri, '**/.gitignore'),
+      new vscode.RelativePattern(rootUri, '**/node_modules/**'),
+      20
+    );
+
+    // 只保留所在目录能覆盖目标路径的 .gitignore，避免写出以 ../ 开头的无效规则
+    const gitignoreFiles = allGitignoreFiles.filter(uri => gitignoreAppliesTo(uri.fsPath, ignoredPath.absolutePath));
+
+    // Sort: root .gitignore first, then alphabetical
+    gitignoreFiles.sort((a, b) => {
+      const aRel = path.relative(repo.rootPath, a.fsPath);
+      const bRel = path.relative(repo.rootPath, b.fsPath);
+      if (aRel === '.gitignore') return -1;
+      if (bRel === '.gitignore') return 1;
+      return aRel.localeCompare(bRel);
+    });
+
+    // If no .gitignore exists, create one at the root
+    let targetPath: string;
+    if (gitignoreFiles.length === 0) {
+      targetPath = path.join(repo.rootPath, '.gitignore');
+    } else if (gitignoreFiles.length === 1) {
+      targetPath = gitignoreFiles[0].fsPath;
+    } else {
+      // Let user pick
+      const picks = gitignoreFiles.map(f => ({
+        label: path.relative(repo.rootPath, f.fsPath),
+        fsPath: f.fsPath,
+      }));
+      const picked = await vscode.window.showQuickPick(picks, {
+        title: t('Add to .gitignore'),
+        placeHolder: t('Select which .gitignore to update'),
+      });
+      if (!picked) return;
+      targetPath = picked.fsPath;
+    }
+
+    // Determine the entry to add (relative to the .gitignore's directory)
+    const gitignoreDir = path.dirname(targetPath);
+    const relativeEntry = path.relative(gitignoreDir, ignoredPath.absolutePath).split(path.sep).join('/');
+    let isDirectory = false;
+    try { isDirectory = fs.statSync(ignoredPath.absolutePath).isDirectory(); } catch { /* 路径不存在时按文件处理 */ }
+    const entry = buildGitignorePattern(relativeEntry, isDirectory);
+    if (!entry) return;
+
+    // Append to .gitignore if not already present
+    let existing = '';
+    try { existing = fs.readFileSync(targetPath, 'utf8'); } catch { /* new file */ }
+    const lines = existing.split('\n').map(l => l.trim());
+    if (lines.includes(entry) || lines.includes(relativeEntry)) {
+      vscode.window.showInformationMessage(t('VersionDock [{0}]: "{1}" is already in {2}', repo.meta.name, entry, path.relative(repo.rootPath, targetPath)));
+      return;
+    }
+    const newContent = existing.endsWith('\n') || existing === ''
+      ? existing + entry + '\n'
+      : existing + '\n' + entry + '\n';
+    fs.writeFileSync(targetPath, newContent, 'utf8');
+    vscode.window.showInformationMessage(t('VersionDock [{0}]: Added "{1}" to {2}', repo.meta.name, entry, path.relative(repo.rootPath, targetPath)));
+
+    // Refresh status so the newly-ignored file disappears
+    const status = await this.manager.getAllStatusesFresh();
+    this.post({ type: 'COMMIT_STATUS_UPDATE', repos: this.manager.getRepoMetas(), status });
   }
 
   private async handleMessage(msg: CommitToHostMsg): Promise<void> {
@@ -4660,70 +4710,12 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
       }
 
       case 'COMMIT_ADD_TO_GITIGNORE': {
-        const repo = this.manager.getRepo(msg.repoId);
-        if (!repo) return;
-        const ignoredPath = repo.resolveRepoPath(msg.entryPath);
-
-        // Find all .gitignore files in the repo
-        const rootUri = vscode.Uri.file(repo.rootPath);
-        const gitignoreFiles = await vscode.workspace.findFiles(
-          new vscode.RelativePattern(rootUri, '**/.gitignore'),
-          new vscode.RelativePattern(rootUri, '**/node_modules/**'),
-          20
-        );
-
-        // Sort: root .gitignore first, then alphabetical
-        gitignoreFiles.sort((a, b) => {
-          const aRel = path.relative(repo.rootPath, a.fsPath);
-          const bRel = path.relative(repo.rootPath, b.fsPath);
-          if (aRel === '.gitignore') return -1;
-          if (bRel === '.gitignore') return 1;
-          return aRel.localeCompare(bRel);
-        });
-
-        // If no .gitignore exists, create one at the root
-        let targetPath: string;
-        if (gitignoreFiles.length === 0) {
-          targetPath = path.join(repo.rootPath, '.gitignore');
-        } else if (gitignoreFiles.length === 1) {
-          targetPath = gitignoreFiles[0].fsPath;
-        } else {
-          // Let user pick
-          const picks = gitignoreFiles.map(f => ({
-            label: path.relative(repo.rootPath, f.fsPath),
-            fsPath: f.fsPath,
-          }));
-          const picked = await vscode.window.showQuickPick(picks, {
-            title: t('Add to .gitignore'),
-            placeHolder: t('Select which .gitignore to update'),
-          });
-          if (!picked) return;
-          targetPath = picked.fsPath;
+        try {
+          await this.addToGitignore(msg);
+        } catch (e: unknown) {
+          const repoName = this.manager.getRepo(msg.repoId)?.meta.name ?? 'Git';
+          vscode.window.showErrorMessage(t('VersionDock [{0}]: {1}', repoName, String(e)));
         }
-
-        // Determine the entry to add (relative to the .gitignore's directory)
-        const gitignoreDir = path.dirname(targetPath);
-        let entry = path.relative(gitignoreDir, ignoredPath.absolutePath);
-        // Normalise to forward slashes
-        entry = entry.split(path.sep).join('/');
-
-        // Append to .gitignore if not already present
-        let existing = '';
-        try { existing = fs.readFileSync(targetPath, 'utf8'); } catch { /* new file */ }
-        const lines = existing.split('\n').map(l => l.trim());
-        if (lines.includes(entry) || lines.includes('/' + entry)) {
-          vscode.window.showInformationMessage(t('VersionDock [{0}]: "{1}" is already in {2}', repo.meta.name, entry, path.relative(repo.rootPath, targetPath)));
-          return;
-        }
-        const newContent = existing.endsWith('\n') || existing === ''
-          ? existing + entry + '\n'
-          : existing + '\n' + entry + '\n';
-        fs.writeFileSync(targetPath, newContent, 'utf8');
-        vscode.window.showInformationMessage(t('VersionDock [{0}]: Added "{1}" to {2}', repo.meta.name, entry, path.relative(repo.rootPath, targetPath)));
-
-        // Refresh status so the newly-ignored file disappears
-        const status = await this.manager.getAllStatusesFresh();
-        this.post({ type: 'COMMIT_STATUS_UPDATE', repos: this.manager.getRepoMetas(), status });
         break;
       }
 
@@ -4734,6 +4726,7 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
         if (typeof svn.addIgnoreEntry !== 'function') return;
         try {
           const result = await svn.addIgnoreEntry(msg.entryPath);
+          if (!result) return;
           if (result.alreadyExists) {
             vscode.window.showInformationMessage(t('VersionDock [{0}]: "{1}" is already in SVN ignore for {2}', repo.meta.name, result.entry, result.directoryPath || '.'));
           } else {
@@ -4772,9 +4765,10 @@ export class CommitPanelProvider implements vscode.WebviewViewProvider, vscode.D
           if (!action) return;
 
           if (action.action === 'add') {
-            const entryPath = await this.pickSvnIgnorePath(repo);
+            const entryPath = await pickSvnIgnorePath(repo);
             if (!entryPath) return;
             const result = await svn.addIgnoreEntry(entryPath);
+            if (!result) return;
             if (result.alreadyExists) {
               vscode.window.showInformationMessage(t('VersionDock [{0}]: "{1}" is already in SVN ignore for {2}', repo.meta.name, result.entry, result.directoryPath || '.'));
             } else {
