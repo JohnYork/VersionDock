@@ -56,6 +56,9 @@ export function getGitEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.Pro
   return {
     ...process.env,
     ...overrides,
+    // Git 自身的诊断文本（冲突、推送被拒、认证失败等）在 gitError / GitService 中
+    // 按英文关键字匹配；固定为 C locale，避免系统语言非英文时这些判断失效。
+    LC_ALL: 'C',
     // Do not let read commands refresh the index and create an optional lock.
     GIT_OPTIONAL_LOCKS: '0',
   };
