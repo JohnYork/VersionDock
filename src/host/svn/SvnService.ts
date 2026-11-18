@@ -482,6 +482,7 @@ export class SvnService extends GitService {
   private statusInFlight?: { generation: number; task: Promise<RepoStatus> };
   private logHistoryEntries: SvnLogEntry[] = [];
   private logHistoryHeadRevision?: string;
+  private logHistoryComplete = false;
   private logHistoryGeneration = 0;
   private headLogInFlight: { limit: number; promise: Promise<SvnLogEntry[]> } | null = null;
   private activeSearches = new Map<string, {
@@ -681,6 +682,19 @@ export class SvnService extends GitService {
   private errorText(error: unknown): string {
     if (error instanceof CliError) return [error.message, error.stderr, error.stdout].filter(Boolean).join('\n');
     return String(error);
+  }
+
+  /**
+   * 判断工作副本路径在指定修订上是否不存在。
+   * 只有 svn 明确报告该修订没有此路径时返回 true；其他错误返回 false，交由调用方原样报错。
+   */
+  private async pathMissingAtRevision(revision: number): Promise<boolean> {
+    try {
+      await this.svn(['info', '--xml', '-r', String(revision)], { timeout: 10_000 });
+      return false;
+    } catch (error: unknown) {
+      return this.errorText(error).includes('E195012');
+    }
   }
 
   private isAuthenticationError(error: unknown): boolean {
@@ -2337,6 +2351,7 @@ export class SvnService extends GitService {
     this.logHistoryGeneration++;
     this.logHistoryEntries = [];
     this.logHistoryHeadRevision = undefined;
+    this.logHistoryComplete = false;
     this.headLogInFlight = null;
     for (const session of this.activeSearches.values()) {
       session.abortController.abort();
@@ -2441,6 +2456,8 @@ export class SvnService extends GitService {
       }
       this.logHistoryEntries = freshEntries;
       this.logHistoryHeadRevision = remoteHead ?? info.revision;
+      // 返回条数少于本次请求上限，说明该路径的线性历史已全部取到，后续无需再向更早翻页
+      this.logHistoryComplete = freshEntries.length < fetchLimit;
       return freshEntries;
     })();
 
@@ -2542,6 +2559,9 @@ export class SvnService extends GitService {
 
         if (oldestRevNumber !== undefined && oldestRevNumber <= 1) {
           entries = this.logHistoryEntries.slice(skip, needTotal);
+        } else if (this.logHistoryComplete) {
+          // 已确认历史取完，直接返回缓存，避免向更早版本发起注定失败的分页查询
+          entries = this.logHistoryEntries.slice(skip, needTotal);
         } else {
           const fetchRange = oldestRevNumber !== undefined && oldestRevNumber > 1
             ? `${oldestRevNumber - 1}:1`
@@ -2564,7 +2584,17 @@ export class SvnService extends GitService {
               }
             }
           } catch (error: unknown) {
-            this.logger?.error('SvnService', 'Failed to fetch linear log page', error);
+            // E195012 可能是“该修订上不存在此路径”（即历史到头），也可能是仓库异常。
+            // 用一次 info 复核：确认节点不存在才判定为到头，其余情况照常报错。
+            const confirmedEnd = this.errorText(error).includes('E195012')
+              && oldestRevNumber !== undefined
+              && await this.pathMissingAtRevision(oldestRevNumber - 1);
+            if (confirmedEnd) {
+              this.logHistoryComplete = true;
+              this.logger?.debug('SvnService', 'Reached the beginning of SVN path history', { revision: oldestRevNumber! - 1 });
+            } else {
+              this.logger?.error('SvnService', 'Failed to fetch linear log page', error);
+            }
           }
           entries = this.logHistoryEntries.slice(skip, needTotal);
         }

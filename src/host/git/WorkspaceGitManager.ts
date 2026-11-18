@@ -74,6 +74,17 @@ type ResolveServiceOptions = {
   placeHolder?: string;
   notFoundMessage?: string;
 };
+type InterleavedLogOptions = {
+  filterText?: string;
+  filterAuthor?: string;
+  filterBranch?: string;
+  filterDateFrom?: string;
+  filterDateTo?: string;
+  filterPath?: string;
+  lineRange?: LineRange;
+  consumer?: string;
+  generation?: number;
+};
 
 function getWorkspaceStatusSignature(status: WorkspaceStatus): string {
   return status.repos
@@ -446,6 +457,16 @@ export class WorkspaceGitManager implements vscode.Disposable {
   private statusUpdateSuppressionDepth = 0;
   private lastPublishedStatus: WorkspaceStatus | null = null;
   private cachedAllBranches: BranchInfo[] = [];
+  /** 多仓库日志分页的会话缓存：按消费者保存已取提交，翻页时只取增量。 */
+  private interleavedLogSessions?: Map<string, {
+    generation?: number;
+    repoIdsKey: string;
+    filterKey: string;
+    repos: Map<string, { entries: CommitLogList; hasMore: boolean }>;
+    pending: Promise<void>;
+  }>;
+  /** 单个仓库在会话缓存中保留的最大条数；超过后回退为每次从头部取全量窗口。 */
+  private interleavedLogCacheLimit = 5000;
   private branchQueryGeneration = 0;
   private mergeCompletionTasks = new Map<string, Promise<MergeCommitResult | undefined>>();
   /** Set after a branch/HEAD change so intermediate checkout states are never published. */
@@ -2458,7 +2479,7 @@ export class WorkspaceGitManager implements vscode.Disposable {
     return fromStatus;
   }
 
-  async getInterleavedLog(repoIds: string[], limit: number, skip: number, opts?: { filterText?: string; filterAuthor?: string; filterBranch?: string; filterDateFrom?: string; filterDateTo?: string; filterPath?: string; lineRange?: LineRange; consumer?: string }): Promise<CommitNode[]> {
+  async getInterleavedLog(repoIds: string[], limit: number, skip: number, opts?: InterleavedLogOptions): Promise<CommitNode[]> {
     const targets = repoIds.length > 0
       ? repoIds.map(id => this.repos.get(id)).filter(Boolean) as GitService[]
       : Array.from(this.repos.values());
@@ -2495,6 +2516,123 @@ export class WorkspaceGitManager implements vscode.Disposable {
     }
 
     const pageEnd = Math.max(limit + skip, limit);
+    if (pageEnd > this.interleavedLogCacheLimit) {
+      // 浏览过深时不再维护增量会话，退回“每次从头部取全量窗口”的旧行为，避免缓存无限增长
+      this.clearInterleavedLogCache();
+      return this.getInterleavedLogWithoutCache(targets, limit, skip, opts, worktreesByMainRepo);
+    }
+    const repoIdsKey = targets.map(r => r.repoId).sort().join('|');
+    const filterKey = [
+      opts?.filterText ?? '',
+      opts?.filterAuthor ?? '',
+      opts?.filterBranch ?? '',
+      opts?.filterDateFrom ?? '',
+      opts?.filterDateTo ?? '',
+      opts?.filterPath ?? '',
+      opts?.lineRange ? `${opts.lineRange.start}:${opts.lineRange.end}` : '',
+    ].join('\u0000');
+
+    // 每个消费者只保留一个会话；任一下列条件成立时视为“重新加载”，丢弃旧缓存。
+    // generation 由 Webview 每次重载递增，翻页保持不变；skip === 0 覆盖
+    // Webview 重建后 generation 归零、与旧会话撞号的情况。
+    const consumerKey = opts?.consumer || 'default';
+    const sessions = this.interleavedLogSessions ??= new Map();
+    let session = sessions.get(consumerKey);
+    if (
+      !session
+      || skip === 0
+      || session.generation !== opts?.generation
+      || session.repoIdsKey !== repoIdsKey
+      || session.filterKey !== filterKey
+    ) {
+      session = {
+        generation: opts?.generation,
+        repoIdsKey,
+        filterKey,
+        repos: new Map(),
+        pending: Promise.resolve(),
+      };
+      sessions.set(consumerKey, session);
+    }
+    const activeSession = session;
+    const repoErrors: Array<{ repoId: string; error: string }> = [];
+    let anyRejected = false;
+
+    // 只补齐到 target 条：已缓存的仓库不再重新输出，元数据也只在首次取数时刷新。
+    const fetchMissing = async (): Promise<void> => {
+      for (const repo of targets) {
+        let state = activeSession.repos.get(repo.repoId);
+        if (!state) {
+          state = { entries: [], hasMore: true };
+          activeSession.repos.set(repo.repoId, state);
+        }
+        if (!state.hasMore || state.entries.length >= pageEnd) continue;
+        const delta = pageEnd - state.entries.length;
+        try {
+          const chunk = await repo.getLog(delta, state.entries.length, {
+            ...opts,
+            worktreeServices: worktreesByMainRepo.get(repo.rootPath) ?? [],
+          }) as CommitLogList;
+          if (chunk.length === 0) {
+            state.hasMore = false;
+            continue;
+          }
+          state.entries.push(...chunk);
+          state.hasMore = chunk.hasMore !== undefined ? chunk.hasMore : chunk.length >= delta;
+          if (chunk.repoErrors && chunk.repoErrors.length > 0) {
+            repoErrors.push(...chunk.repoErrors);
+          }
+        } catch (err: unknown) {
+          anyRejected = true;
+          state.hasMore = false;
+          repoErrors.push({ repoId: repo.repoId, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+    };
+    // 串行化同一会话内的请求，避免并发的翻页重复追加同一批提交。
+    activeSession.pending = activeSession.pending.then(fetchMissing, fetchMissing);
+    try {
+      await activeSession.pending;
+    } catch (err: unknown) {
+      anyRejected = true;
+      repoErrors.push({ repoId: '', error: err instanceof Error ? err.message : String(err) });
+    }
+
+    const commitLogs: CommitLogList[] = targets.map(repo => activeSession.repos.get(repo.repoId)?.entries ?? []);
+    const anyHasMore = targets.some(repo => activeSession.repos.get(repo.repoId)?.hasMore === true);
+    const allExplicitLast = !anyRejected && targets.length > 0
+      && targets.every(repo => activeSession.repos.get(repo.repoId)?.hasMore === false);
+    // Each service already returns Git's date order. Merge only the current
+    // head of each repository so the workspace log remains date-ordered when
+    // several repositories are shown together.
+    const allCommits = interleaveCommitLogs(commitLogs);
+    const sliced: CommitLogList = allCommits.slice(skip, skip + limit);
+    const hasBufferedMore = allCommits.length > skip + limit;
+    if (hasBufferedMore || anyHasMore) {
+      sliced.hasMore = true;
+    } else if (allExplicitLast || anyRejected) {
+      sliced.hasMore = false;
+    }
+    if (repoErrors.length > 0) {
+      sliced.repoErrors = repoErrors;
+    }
+    return sliced;
+  }
+
+  /** 清空多仓库日志分页会话缓存；下次请求会重新从头部取数。 */
+  clearInterleavedLogCache(): void {
+    this.interleavedLogSessions?.clear();
+  }
+
+  /** 不使用会话缓存的兜底分页：每个仓库每次从头部取到 pageEnd。 */
+  private async getInterleavedLogWithoutCache(
+    targets: GitService[],
+    limit: number,
+    skip: number,
+    opts: InterleavedLogOptions | undefined,
+    worktreesByMainRepo: Map<string, GitService[]>,
+  ): Promise<CommitNode[]> {
+    const pageEnd = Math.max(limit + skip, limit);
     const results = await Promise.allSettled(
       targets.map(r => r.getLog(pageEnd, 0, { ...opts, worktreeServices: worktreesByMainRepo.get(r.rootPath) ?? [] }))
     );
@@ -2517,9 +2655,6 @@ export class WorkspaceGitManager implements vscode.Disposable {
     }
     const anyHasMore = commitLogs.some(log => log.hasMore === true);
     const allExplicitLast = !anyRejected && commitLogs.length > 0 && commitLogs.every(log => log.hasMore === false);
-    // Each service already returns Git's date order. Merge only the current
-    // head of each repository so the workspace log remains date-ordered when
-    // several repositories are shown together.
     const allCommits = interleaveCommitLogs(commitLogs);
     const sliced: CommitLogList = allCommits.slice(skip, skip + limit);
     const hasBufferedMore = allCommits.length > skip + limit;

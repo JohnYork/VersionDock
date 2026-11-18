@@ -439,6 +439,8 @@ export class GitLogPanelProvider implements vscode.WebviewViewProvider, vscode.D
   refresh(options?: { repoIds?: string[]; forceRemoteRefs?: boolean }): void {
     const forceRemoteRefs = options?.forceRemoteRefs ?? false;
     const repoIdFilter = options?.repoIds && options.repoIds.length > 0 ? new Set(options.repoIds) : undefined;
+    // Git 多仓库日志的分页会话与 SVN 的日志缓存一样，需要在刷新时显式失效
+    this.manager.clearInterleavedLogCache();
     for (const meta of this.manager.getRepoMetas()) {
       if (repoIdFilter && !repoIdFilter.has(meta.id)) {
         continue;
@@ -984,6 +986,7 @@ export class GitLogPanelProvider implements vscode.WebviewViewProvider, vscode.D
             filterPath: msg.filterPath,
             lineRange: msg.lineRange,
             consumer,
+            generation: msg.generation,
           });
           const explicitHasMore = (commits as CommitLogList).hasMore;
           const repoErrors = (commits as CommitLogList).repoErrors;
@@ -1751,12 +1754,13 @@ export class GitLogPanelProvider implements vscode.WebviewViewProvider, vscode.D
             filterDateTo: msg.filterDateTo,
             filterPath: msg.filterPath,
           });
+          const explicitCompareHasMore = (commits as CommitLogList).hasMore;
           this.post({
             type: 'LOG_COMPARE_COMMITS_RESULT',
             requestId: msg.requestId,
             side: msg.side,
             commits,
-            isLast: commits.length < msg.limit,
+            isLast: explicitCompareHasMore !== undefined ? !explicitCompareHasMore : commits.length < msg.limit,
           });
         } catch (e: unknown) {
           this.post({

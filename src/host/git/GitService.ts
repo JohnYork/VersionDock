@@ -1702,12 +1702,14 @@ export class GitService {
       return [];
     }
 
+    // 多取一条用于判断是否还有更早的历史，避免调用方只能靠“返回条数 < 页大小”猜测
+    const fetchCount = revisionSearch ? 1 : Math.max(limit, 0) + 1;
     const args: string[] = [
       'log',
       // Match JetBrains' history ordering: prioritize commit dates while
       // still respecting the parent/child relationship between commits.
       '--date-order',
-      `--max-count=${revisionSearch ? 1 : limit}`, `--skip=${revisionSearch ? 0 : skip}`,
+      `--max-count=${fetchCount}`, `--skip=${revisionSearch ? 0 : skip}`,
       LOG_RECORD_FORMAT,
       '--date=iso-strict',
     ];
@@ -1758,7 +1760,9 @@ export class GitService {
       }
       throw err;
     }
-    const commits = parseLogOutput(raw, this.repoId, metadata.refsByHash);
+    const parsed = parseLogOutput(raw, this.repoId, metadata.refsByHash);
+    const hasMore = !revisionSearch && parsed.length > limit;
+    const commits: CommitLogList = hasMore ? parsed.slice(0, limit) : parsed;
 
     // Mark unpushed commits: hashes ahead of the remote tracking branch.
     // 'all' means there is no upstream — every commit on this branch is local.
@@ -1779,6 +1783,7 @@ export class GitService {
       if (incomingHashes.has(c.hash)) c.incoming = true;
     }
 
+    commits.hasMore = revisionSearch ? false : hasMore;
     return commits;
   }
 
@@ -1814,9 +1819,11 @@ export class GitService {
     const range = opts.side === 'baseOnly'
       ? `${targetRef}..${baseRef}`
       : `${baseRef}..${targetRef}`;
+    // 与 getLog 一致：多取一条用于判断是否还有更多比较结果
+    const fetchCount = revisionSearch ? 1 : Math.max(limit, 0) + 1;
     const args: string[] = [
       'log',
-      `--max-count=${revisionSearch ? 1 : limit}`,
+      `--max-count=${fetchCount}`,
       `--skip=${revisionSearch ? 0 : skip}`,
       LOG_RECORD_FORMAT,
       '--date=iso-strict',
@@ -1832,7 +1839,11 @@ export class GitService {
       this.git.raw(args),
       this.getDecoratedRefsByCommit(),
     ]);
-    return parseLogOutput(raw, this.repoId, refsByHash);
+    const parsed = parseLogOutput(raw, this.repoId, refsByHash);
+    const hasMore = !revisionSearch && parsed.length > limit;
+    const commits: CommitLogList = hasMore ? parsed.slice(0, limit) : parsed;
+    commits.hasMore = revisionSearch ? false : hasMore;
+    return commits;
   }
 
   /**
